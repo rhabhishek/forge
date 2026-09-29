@@ -1,0 +1,20 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "A Cortex-adjacent staff-engineer code-delivery swarm: a bounded implement -> review -> refine loop.",
+  "type": "module",
+  "bin": {
+    "forge": "bin/forge.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "doctor": "node bin/forge.mjs doctor",
+    "leak-check": "node bin/forge.mjs leak-check",
+    "setup": "node bin/forge.mjs install --apply"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

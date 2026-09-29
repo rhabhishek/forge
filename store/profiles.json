@@ -1,0 +1,11 @@
+{
+  "$comment": "Forge is single-profile by design: one engineer profile enabling the core loop (forge/implementer/reviewer) plus the lazy escalation agents (architect, sme-*). The lazy agents are installed but only invoked conditionally by the gate, so token cost stays on-demand.",
+  "default": "engineer",
+  "profiles": {
+    "engineer": {
+      "title": "Staff Engineer",
+      "description": "Code delivery at a staff-engineer bar: bounded implement -> review -> refine, with lazy architect/SME escalation.",
+      "agents": ["forge", "implementer", "reviewer", "architect", "sme-security", "sme-performance", "sme-domain", "sme-a11y"]
+    }
+  }
+}

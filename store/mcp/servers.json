@@ -1,0 +1,48 @@
+{
+  "$comment": "Forge MCP server catalog. Provisioned into VS Code's user mcp.json and ~/.copilot/mcp-config.json by the interactive wizard offered at the end of `forge install --apply`. Tokens are referenced as ${env:VAR} and read from your shell env — never stored inline. Forge only ever writes/updates/removes entries it owns (_source: forge); any server already present that Forge doesn't own (yours, or one Cortex provisioned) is skipped, not duplicated. GitHub authenticates with your PAT. Jira uses Atlassian's official remote Rovo server over OAuth (sign in once in-editor); it also covers Confluence, but a separate community Confluence server is provided per request. Figma uses its remote MCP server (OAuth in-editor). _source is kept so Forge updates/removes only its own entries; other _* fields are display metadata, stripped on write.",
+  "servers": {
+    "io.github.github/github-mcp-server": {
+      "_source": "forge",
+      "_label": "GitHub (official MCP, PAT)",
+      "_description": "GitHub's official remote MCP server, authenticated with your stored PAT (no OAuth).",
+      "_optional": true,
+      "_requires": ["GITHUB_TOKEN"],
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${env:GITHUB_TOKEN}"
+      }
+    },
+    "atlassian": {
+      "_source": "forge",
+      "_label": "Atlassian (Jira Rovo MCP)",
+      "_description": "Atlassian's official remote Rovo MCP server for Jira (OAuth — sign in once in-editor). Also serves Confluence; a separate 'confluence' server is provided as well.",
+      "_optional": true,
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v1/mcp"
+    },
+    "confluence": {
+      "_source": "forge",
+      "_label": "Confluence (community MCP, API token)",
+      "_description": "Community Confluence MCP server run via npx (stdio). Uses your Atlassian API token + site name from the shell env.",
+      "_optional": true,
+      "_requires": ["ATLASSIAN_API_TOKEN"],
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@aashari/mcp-server-atlassian-confluence"],
+      "env": {
+        "ATLASSIAN_SITE_NAME": "${env:ATLASSIAN_SITE_NAME}",
+        "ATLASSIAN_USER_EMAIL": "${env:ATLASSIAN_EMAIL}",
+        "ATLASSIAN_API_TOKEN": "${env:ATLASSIAN_API_TOKEN}"
+      }
+    },
+    "figma": {
+      "_source": "forge",
+      "_label": "Figma (remote MCP, OAuth)",
+      "_description": "Figma's remote MCP server. Sign in via OAuth in your editor on first use.",
+      "_optional": true,
+      "type": "http",
+      "url": "https://mcp.figma.com/mcp"
+    }
+  }
+}
