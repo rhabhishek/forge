@@ -9,4 +9,8 @@
 - **Handoff packet and results:** a comment on the issue, or on the pull request once one exists.
 - **Finding work:** list open issues by state label, oldest first. An item nobody is working on has no open pull request and no recent status comment.
 - **Tools:** use the host's GitHub tools when present, otherwise the `gh` CLI.
+- **Inline review on a pull request:** one review per pass, through the REST endpoint (GraphQL is not available in a cloud session):
+  `gh api -X POST repos/<owner>/<repo>/pulls/<n>/reviews --input review.json`
+  with `{"commit_id": "<head sha reviewed>", "event": "COMMENT", "body": "<short summary>", "comments": [{"path": "<file>", "line": <line in the new file>, "side": "RIGHT", "body": "**[severity]** problem, why, required fix"}]}`.
+  The line must be part of the diff (`gh api repos/<owner>/<repo>/pulls/<n>/files` lists it); for a deleted line use `"side": "LEFT"`. Keep `event` as `COMMENT`. Reply to a finding with `gh api -X POST repos/<owner>/<repo>/pulls/<n>/comments/<comment id>/replies -f body=...`.
 - **Never:** merge, close a pull request you did not open, edit labels' definitions, or change repository settings.

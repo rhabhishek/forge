@@ -32,7 +32,7 @@ Then hand to `engineer`. If the item is also waiting on `architect`, leave the s
 
 ## Reviewing built work
 
-When `tester` or `engineer` sends you screenshots or a running preview for a change you specified, compare it with the spec and report differences as findings with severity, the same way the reviewer does. You are judging the result, not the code.
+When `tester` or `engineer` sends you screenshots or a running preview for a change you specified, compare it with the spec and report differences as findings with severity, inline on the change request and in the same form the reviewer uses (the protocol's "Reporting findings"). You are judging the result, not the code.
 
 ## Standing work
 

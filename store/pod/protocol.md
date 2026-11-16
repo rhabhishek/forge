@@ -89,6 +89,19 @@ All limits come from the contract's `limits`. The handoff command enforces them 
 - **No new evidence, no retry.** Repeating a failed step unchanged is not progress. Change the approach or escalate.
 - **Collisions:** before starting, an `engineer` checks open change requests for overlapping files. On overlap, leave the item `ready` and note which change it waits for.
 
+## Reporting findings
+
+When a role judges a change request (`reviewer`, `tester`, and `ux` when it reviews built work), it reports findings **inline**: one comment per finding, anchored to the file and line it concerns.
+
+- **Each comment** carries a severity tag (`blocker`, `major`, `minor` or `nit`), what is wrong, why it matters, and the fix required. One finding per comment.
+- **Anchor to the changed line.** If the cause is code outside the change, anchor to the nearest changed line (the test that should have caught it, for example) and name the real location in the comment.
+- **The summary is short.** It holds the verdict, the count of findings by severity, and the gate result in a few lines. Evidence that does not belong on a line (a table mapping criteria to tests, an experiment log) goes in one compact comment on the work item, and the summary links to it. A single long block comment is never the report.
+- **A finding about no line** (the gate failed, a criterion has no test at all) goes in the summary.
+- **Comment, never approve.** Post the review as a comment review. Approving or requesting changes formally is a person's act.
+- **Permission.** Posting the inline review is part of the role's reporting. It does not need a separate grant, and a packet that limits outward comments still allows it. If a packet seems to forbid it, say so in your report and post the findings as a list of `file:line` entries in one comment instead. Do not silently fall back to a long block.
+- **If the tracker cannot take inline comments**, say so, and use that same list.
+- The tracker note says how to post an inline review there.
+
 ## Questions
 
 If you need a human decision, do not stall the pod. Write the question on the work item with the options and your recommendation, move it to `needs_human`, and pick up other work.

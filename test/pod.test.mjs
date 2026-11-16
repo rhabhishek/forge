@@ -322,6 +322,31 @@ test('claude-cloud handoff names the role task to fire; manual hands the text to
   assert.throws(() => planHandoff(contract(), 'intern', 'p'), /Unknown role/);
 });
 
+// ---------- reporting findings ----------
+
+test('judging roles are told to report findings inline, and the tracker notes say how', () => {
+  const read = (...p) => fs.readFileSync(path.join(STORE_DIR, ...p), 'utf8');
+  const protocol = read('pod', 'protocol.md');
+  const section = protocol.slice(protocol.indexOf('## Reporting findings'), protocol.indexOf('## Questions'));
+  assert.ok(section.length > 200, 'protocol has a Reporting findings section');
+  for (const rule of [/one comment per finding/, /anchored to the file and line/, /blocker.*major.*minor.*nit/s,
+    /summary is short/, /single long block comment is never the report/, /never approve/i, /does not need a separate grant/]) {
+    assert.match(section, rule);
+  }
+  // The roles that judge a change point at the section instead of restating it.
+  for (const file of [['agents', 'tester.agent.md'], ['agents', 'ux.agent.md'], ['pod', 'roles', 'reviewer.md']]) {
+    assert.match(read(...file), /inline/i, `${file.join('/')} must mention inline findings`);
+  }
+  assert.match(read('pod', 'roles', 'reviewer.md'), /Reporting findings/);
+  assert.match(read('agents', 'tester.agent.md'), /Reporting findings/);
+  // How, per tracker: GitHub names the endpoint; Jira says where inline comments go.
+  const github = read('pod', 'trackers', 'github.md');
+  assert.match(github, /pulls\/<n>\/reviews/);
+  assert.match(github, /"event": "COMMENT"/);
+  assert.match(github, /GraphQL is not available/);
+  assert.match(read('pod', 'trackers', 'jira.md'), /inline on the pull request/);
+});
+
 // ---------- ledger: limits are enforced where the pod actually runs ----------
 
 // In-memory GitHub REST double. Timestamps come from a counter, like a server
