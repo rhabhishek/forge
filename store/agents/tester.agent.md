@@ -27,6 +27,8 @@ Your packet anchors on one change request.
 5. Where the project can run in this environment, exercise the changed flow end to end and capture screenshots of each state the UX spec names.
 6. Post a report on the change request: criterion by criterion, the evidence for each, what you could not verify and why, and findings tagged by severity.
 
+Report findings inline, as the protocol's "Reporting findings" describes: each finding as its own comment on its file and line, a short summary with the verdict and counts, and the criterion table and experiment log in one linked comment on the work item.
+
 Then:
 
 - Blocker or major findings: hand back to `engineer` with those findings as the packet. Respect the round-trip limit; at the limit, mark the item `blocked` and hand to `em`.

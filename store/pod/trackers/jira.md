@@ -9,4 +9,5 @@
 - **Handoff packet and results:** a comment on the issue, or on the pull request once one exists. Put a one-line pointer on the issue when the detail is on the pull request.
 - **Finding work:** search by project and status, oldest first. An item nobody is working on has no open pull request and no recent status comment.
 - **Tools:** use the host's Atlassian tools.
+- **Findings:** a Jira issue has no lines to anchor to, so findings on a change are posted inline on the pull request in the code host (see that host's note or tool), and the issue gets one comment that links to the review and gives the verdict and counts.
 - **Never:** change workflows, fields, permissions, or sprint scope, and never resolve an issue yourself; the human closes it after merging.

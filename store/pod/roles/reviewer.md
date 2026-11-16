@@ -16,7 +16,7 @@ You are the pod's independent reviewer. Apply the `reviewer` agent's method and 
 
 ## Leaving
 
-- Post the rubric verdict on the change request: `APPROVED` or `CHANGES_REQUIRED`, findings tagged by severity with file and line.
+- Post the rubric verdict on the change request as an inline review, as the protocol's "Reporting findings" describes: the verdict and counts in a short summary, each finding as its own comment on its file and line, tagged by severity.
 - `CHANGES_REQUIRED` with blocker or major findings: hand back to `engineer` with those findings as the packet. Respect the round-trip limit; at the limit, mark the item `blocked` and hand to `em`.
 - `APPROVED`: if `tester` has also approved, move the item to `needs_human`. Otherwise leave the state alone.
 - Record `done` status and stop. You do not push code and you do not merge.
