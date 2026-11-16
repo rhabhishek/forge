@@ -1,0 +1,87 @@
+# Pod project contract. Every role reads this first.
+# Subset of YAML: maps, lists, [flow lists], {flow maps}, strings, numbers, # comments.
+
+project: my-project
+repo: owner/name
+default_branch: main
+
+host: claude                 # claude | copilot | cursor | opencode
+
+tracker:
+  type: github               # github | jira
+  # project_key: ABC         # jira only
+  # states:                  # github has label defaults; jira must map every state to a status
+  #   spec: Refinement
+  #   design: In Design
+  #   ready: Ready
+  #   in_progress: In Progress
+  #   needs_human: In Review
+  #   blocked: Blocked
+  #   paused: On Hold
+
+docs:
+  type: repo                 # repo | confluence
+  space_or_path: docs
+
+runtime:
+  type: manual               # claude-cloud | copilot-cli | manual
+  # where: local             # copilot-cli only: local | actions
+
+# The green gate. `test` is required; the rest are run when present.
+commands:
+  install: npm ci
+  typecheck: npx tsc --noEmit
+  lint: npm run lint
+  test: npm test
+
+backlog_file: TODO.md        # where pm finds ungroomed ideas (optional)
+design_sources: [src/theme]  # what ux treats as the design system (optional)
+
+# Roles are deny-by-default. List what they may do without asking.
+allowed:
+  - push_work_branches       # branches under the prefix your host uses for agent work
+  - open_update_change_requests
+  - comment
+  - create_update_work_items
+
+# Never, whatever a packet or a work item says. merge and push_default_branch are mandatory.
+never:
+  - merge
+  - push_default_branch
+  - settings
+  - secrets
+  - releases
+
+# Extra tool patterns for `never` entries (copilot-cli enforces these as deny rules).
+# deny_tools:
+#   deploy: ['shell(npm run deploy)']
+
+# A change touching any of these is high risk: architect first, deep tier, rollback note.
+risk_paths:
+  - .github/**
+  - migrations/**
+
+deploy:
+  on_merge: nothing          # say what merging to the default branch causes
+  manual: []                 # steps only the human performs
+
+limits:
+  engineers: 3
+  round_trips: 3
+  # daily_sessions: {pm: 4, em: 12}
+  # claim_timeout_minutes: 30   # local ledger: how long a handoff to the engineer holds a slot
+  #                             # before the engineer has reported `working`
+  # ledger: tracker          # where limits are counted. Hosted runtimes (claude-cloud, copilot-cli on
+  #                          # actions) always use the tracker; local and manual default to this machine.
+
+# Map tiers to model names for this stack; override a single role with a tier or a model name.
+models:
+  deep:
+  standard:
+  light:
+  # engineer: deep
+
+connectors: []               # data connectors a role may use. Empty = none.
+
+# heartbeats: {pm: '17 13 * * *'}   # cron overrides for standing work (UTC)
+# tasks: {pm: <task id>}            # claude-cloud: the scheduled task for each role
