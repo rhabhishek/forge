@@ -2,6 +2,8 @@
 
 The pod is a set of independent role agents. Each role runs in its own session with its own context, does one kind of work, and hands the result to the next role. Nobody routes work centrally and nobody waits for a meeting. This file is the contract every role follows. The project's own facts and limits are in the **project contract** (`{{POD_CONTRACT}}`; `{{POD_CLI}} config` prints it resolved).
 
+Every path in the pod's files is relative to the repository root. Work from the root. The pod CLI finds the project from any directory beneath it, but the paths it prints are root-relative.
+
 Read the project contract first, every session. Then read the tracker, docs, and runtime notes under `{{POD_HOME}}` that it selects (`trackers/<type>.md`, `docs/<type>.md`, `runtimes/<type>.md`).
 
 ## Roles
@@ -45,11 +47,11 @@ Move the state when you hand off, not before. The state is the durable record; a
    - **Constraints / non-goals:** scope limits and anything that must not change.
    - **Acceptance evidence:** how the next role, and the human, will know it is done.
    - **Allowed effects:** exactly what the next role may do. A packet can narrow the project contract's `allowed` list. It can never widen it.
-3. Move the work item to its next state.
-4. Start the next role with the packet: `{{POD_CLI}} handoff <role> --packet <file> --item <id> --from <your role>`. Follow what it prints; on some runtimes it starts the role itself, on others it tells you which host action to take.
+3. Start the next role with the packet: `{{POD_CLI}} handoff <role> --packet <file> --item <id> --from <your role>`. Always pass `--item` and `--from`. The command checks the limits, records the handoff on the work item, and, for a handoff to `engineer`, moves the item into `in_progress` itself. Follow what it prints; on some runtimes it starts the role, on others it tells you which host action to take.
+4. For every other handoff, move the work item to its next state once the command has accepted it.
 5. Record your own status (`{{POD_CLI}} status <role> done --item <id>`) and stop. Do not wait for the next role.
 
-If the handoff command refuses (a limit, or the pod is paused), do not work around it. Leave the item in its current state, say why on the item, and stop.
+**The handoff command is the only way to start another role.** Never start one by any other means, and never take a host action for a handoff the command did not print. If it refuses (a limit was reached, the pod is paused, or the limits could not be verified), the refusal is final for this session: do not retry, do not work around it, and do not count or judge the limits yourself. Leave the item in its current state, write the reason on the item, and stop.
 
 Two roles can be handed the same item at once (`reviewer` and `tester`). Each reports independently. The item moves to `needs_human` only when both have approved; the second to finish makes that move.
 
@@ -57,7 +59,7 @@ Two roles can be handed the same item at once (`reviewer` and `tester`). Each re
 
 Roles with standing work start on a heartbeat. On a heartbeat:
 
-1. If the pod is `paused`, stop.
+1. Record `working` status first. If that command says to stop (the pod is paused, or the pause state cannot be read), stop.
 2. Sweep for items sitting in a state you own with no one working on them. A handoff was lost; pick the oldest up.
 3. Otherwise do your standing work, as described in your role. Keep it small and finish it within the session.
 
@@ -80,7 +82,7 @@ A change is **high risk** when it touches any path in the contract's `risk_paths
 
 ## Limits
 
-All limits come from the contract's `limits`.
+All limits come from the contract's `limits`. The handoff command enforces them from a ledger it keeps itself: on a hosted runtime the ledger is the tracker (a marker on each work item plus the items' states), so the counts survive between sessions and machines. Roles do not count anything.
 
 - **Engineers:** at most `limits.engineers` items in build at once. Past that, items stay `ready`.
 - **Round trips:** `reviewer` or `tester` may send a change back to `engineer` at most `limits.round_trips` times. Past that the item becomes `blocked` and goes to `em`. Each round must reduce open blocker/major findings; a round that does not is treated as the last.
@@ -93,7 +95,7 @@ If you need a human decision, do not stall the pod. Write the question on the wo
 
 ## Status
 
-Record status at the start and end of every session: `{{POD_CLI}} status <role> working --item <id>` and `... done`. Use `blocked` or `waiting` with `--note` when that is the truth. The board and `em` read this log; an agent that does not report looks crashed.
+Record status at the start and end of every session: `{{POD_CLI}} status <role> working --item <id>` and `... done`. If recording `working` tells you to stop, stop. Use `blocked` or `waiting` with `--note` when that is the truth. The board and `em` read this log; an agent that does not report looks crashed.
 
 ## Lessons
 

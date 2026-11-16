@@ -11,4 +11,4 @@ Act as the pod's `engineer` role for this session. Read `{{POD_HOME}}/protocol.m
 - **With a work item or change request named but no packet:** build the packet yourself from that item (Intent, Goal, Anchor, Constraints / non-goals, Acceptance evidence, Allowed effects), state it, then act on it.
 - **With nothing named:** this is a heartbeat. Sweep for lost handoffs in the states your role owns, then do your standing work.
 
-Record status at the start and end with `{{POD_CLI}} status engineer <state>`. When your part is done, hand off with `{{POD_CLI}} handoff <role> --packet <file> --item <id> --from engineer` and stop; do not wait for the next role. Never merge, and never do another role's job.
+All paths are relative to the repository root; work from there. Record status at the start and end with `{{POD_CLI}} status engineer <state>`. When your part is done, hand off with `{{POD_CLI}} handoff <role> --packet <file> --item <id> --from engineer` and stop; do not wait for the next role. If either command tells you to stop or refuses, that is final: do not retry or work around it. Never merge, and never do another role's job.

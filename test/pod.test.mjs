@@ -15,8 +15,8 @@ import {
 import { planUpdate } from '../lib/update.mjs';
 import {
   ROLE_NAMES, ROLES, BASELINE_NEVER, parseYaml, normalizeConfig, validateConfig, loadConfig,
-  findConfig, planHandoff, handoffGuards, appendStatus, readStatus, allDenyPatterns, modelFor,
-  renderBoard, boardData, renderWorkflow, main,
+  findConfig, findProject, planHandoff, appendStatus, readStatus, allDenyPatterns, modelFor,
+  renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, ledgerKind, EXIT,
 } from '../lib/pod.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `forge-pod-${name}-`));
@@ -322,28 +322,320 @@ test('claude-cloud handoff names the role task to fire; manual hands the text to
   assert.throws(() => planHandoff(contract(), 'intern', 'p'), /Unknown role/);
 });
 
-test('guards refuse a handoff past the engineer, round-trip, or daily limits, and when paused', () => {
+// ---------- ledger: limits are enforced where the pod actually runs ----------
+
+// In-memory GitHub REST double. Timestamps come from a counter, like a server
+// clock, so ordering between "concurrent" writers is deterministic.
+function fakeGithub({ issues = {}, comments = [] } = {}) {
+  const db = { issues: new Map(), comments: [...comments], calls: [], tick: 0, fail: null, onPost: null };
+  for (const [n, labels] of Object.entries(issues)) db.issues.set(String(n), { number: Number(n), labels: [...labels] });
+  const stamp = () => new Date(Date.UTC(2030, 0, 1, 0, 0, ++db.tick)).toISOString();
+  const issue = (n) => db.issues.get(n) || db.issues.set(n, { number: Number(n), labels: [] }).get(n);
+  const view = (c) => ({ body: c.body, created_at: c.created_at, issue_url: `https://api.example/repos/acme/app/issues/${c.issue}` });
+  db.addComment = (n, body, at) => db.comments.push({ issue: String(n), body, created_at: at || stamp() });
+  db.transport = async ({ method = 'GET', path: p, query = {}, body }) => {
+    db.calls.push(`${method} ${p}`);
+    if (db.fail) throw new Error(db.fail);
+    const m = p.match(/^repos\/acme\/app\/issues(?:\/(comments|\d+))?(?:\/(comments|labels))?(?:\/(.+))?$/);
+    assert.ok(m, `unexpected path ${p}`);
+    const [, first, second, third] = m;
+    if (!first) {
+      return [...db.issues.values()].filter((i) => i.labels.includes(query.labels))
+        .map((i) => ({ number: i.number, labels: i.labels.map((name) => ({ name })), ...(i.pr ? { pull_request: {} } : {}) }));
+    }
+    if (first === 'comments') return db.comments.filter((c) => c.created_at >= query.since).map(view);
+    if (!second) return { number: Number(first), labels: issue(first).labels.map((name) => ({ name })) };
+    if (second === 'comments' && method === 'GET') return db.comments.filter((c) => c.issue === first).map(view);
+    if (second === 'comments' && method === 'POST') {
+      if (db.onPost) { const hook = db.onPost; db.onPost = null; hook(db, stamp); }
+      const c = { issue: first, body: body.body, created_at: stamp() };
+      db.comments.push(c);
+      return view(c);
+    }
+    if (second === 'labels' && method === 'POST') { issue(first).labels.push(...body.labels); return []; }
+    if (second === 'labels' && method === 'DELETE') {
+      issue(first).labels = issue(first).labels.filter((l) => l !== decodeURIComponent(third));
+      return [];
+    }
+    throw new Error(`unhandled ${method} ${p}`);
+  };
+  return db;
+}
+
+const CLOUD = { repo: 'acme/app', runtime: 'claude-cloud', tasks: Object.fromEntries(ROLE_NAMES.map((r) => [r, `task_${r}`])) };
+const BUILD = 'pod: in-progress';
+
+test('hosted runtimes count limits on the tracker; a local ledger there is rejected', () => {
+  assert.equal(ledgerKind(contract(CLOUD)), 'tracker');
+  assert.equal(ledgerKind(contract({ ...WORK, runtime: { type: 'copilot-cli', where: 'actions' } })), 'tracker');
+  assert.equal(ledgerKind(contract(WORK)), 'local');
+  assert.equal(ledgerKind(contract()), 'local');
+  assert.equal(ledgerKind(contract({ ...WORK, limits: { ledger: 'tracker' } })), 'tracker');
+  for (const hosted of [CLOUD, { ...WORK, runtime: { type: 'copilot-cli', where: 'actions' } }]) {
+    const { errors } = validateConfig(contract({ ...hosted, limits: { ledger: 'local' } }));
+    assert.ok(errors.some((e) => /hosted runtime .* must use the tracker ledger/.test(e)), 'doctor must reject it');
+  }
+  assert.ok(validateConfig(contract({ limits: { ledger: 'disk' } })).errors.some((e) => /limits\.ledger/.test(e)));
+});
+
+test('on a hosted runtime with an empty machine, every limit and the pause still bind', async () => {
+  // The regression: nothing on local disk, so a disk-based count would be zero.
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...CLOUD, limits: { engineers: 3, round_trips: 3, daily_sessions: { pm: 2 } } });
+  const gh = fakeGithub({ issues: { 1: [BUILD], 2: [BUILD], 3: [BUILD], 4: ['pod: ready'], 9: [BUILD] } });
+  gh.issues.get('9').pr = true; // a pull request carrying the label is not a work item
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.equal(ledger.kind, 'tracker');
+
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: '4', from: 'pm' }, env), /engineer limit reached \(3\/3\)/);
+  assert.equal(gh.comments.length, 0, 'a refused handoff records nothing');
+  assert.deepEqual(gh.issues.get('4').labels, ['pod: ready'], 'and leaves the item where it was');
+
+  // Rework on an item already in build holds its slot; round trips are counted on the item.
+  for (let i = 0; i < 3; i++) {
+    assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '1', from: i % 2 ? 'tester' : 'reviewer' }, env), null);
+  }
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: '1', from: 'reviewer' }, env), /round-trip limit reached for 1 \(3\/3\)/);
+  assert.equal(gh.comments.filter((c) => c.issue === '1').length, 3);
+  assert.match(gh.comments[0].body, /^<!-- pod:handoff from=reviewer to=engineer -->/);
+
+  // Daily cap, counted from markers written since midnight UTC.
+  const today = new Date().toISOString();
+  gh.addComment(5, '<!-- pod:handoff from=sre to=pm -->', today);
+  assert.equal(await checkHandoff(ledger, cfg, 'pm', { item: '5', from: 'sre' }, env), null);
+  gh.addComment(6, '<!-- pod:handoff from=tester to=pm -->', today);
+  assert.match(await checkHandoff(ledger, cfg, 'pm', { item: '5', from: 'sre' }, env), /daily session cap reached for pm \(2\/2\)/);
+
+  // Pause is a tracker state, visible to every machine.
+  gh.issues.set('7', { number: 7, labels: ['pod: paused'] });
+  assert.match(await claimHandoff(ledger, cfg, 'reviewer', { item: '1', from: 'engineer' }, env), /paused/);
+});
+
+test('a slot freed on the tracker is usable, and the handoff command moves the item into build', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...CLOUD, limits: { engineers: 1 } });
+  const gh = fakeGithub({ issues: { 1: [BUILD], 2: ['pod: ready', 'bug'] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: '2', from: 'pm' }, env), /limit reached/);
+  gh.issues.get('1').labels = ['pod: needs-human'];
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '2', from: 'pm' }, env), null);
+  assert.deepEqual(gh.issues.get('2').labels.sort(), ['bug', BUILD].sort(), 'state swapped, other labels kept');
+});
+
+test('two handoffs racing for the last engineer slot leave exactly one standing', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...CLOUD, limits: { engineers: 1 } });
+  const rival = (earlier) => (db, stamp) => {
+    // Another session claims item 8 between our check and our write.
+    const at = earlier ? stamp() : null;
+    db.issues.set('8', { number: 8, labels: [BUILD] });
+    if (earlier) db.addComment(8, '<!-- pod:handoff from=pm to=engineer -->', at);
+    else db.later = () => db.addComment(8, '<!-- pod:handoff from=pm to=engineer -->');
+  };
+
+  // The rival's marker is older than ours: we withdraw.
+  let gh = fakeGithub({ issues: { 5: ['pod: ready'] } });
+  gh.onPost = rival(true);
+  let ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: '5', from: 'pm' }, env), /concurrent handoff; the item is back in the ready state/);
+  assert.deepEqual(gh.issues.get('5').labels, ['pod: ready']);
+  assert.match(gh.comments.at(-1).body, /pod:release from=pm to=engineer/);
+
+  // The rival's marker is newer than ours: we stand (the rival's own run withdraws).
+  gh = fakeGithub({ issues: { 5: ['pod: ready'] } });
+  gh.onPost = rival(false);
+  const post = gh.transport;
+  gh.transport = async (req) => { const r = await post(req); if (gh.later && req.method === 'POST' && /comments$/.test(req.path)) { gh.later(); gh.later = null; } return r; };
+  ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '5', from: 'pm' }, env), null);
+  assert.deepEqual(gh.issues.get('5').labels, [BUILD]);
+});
+
+test('the handoff command fails closed when limits cannot be verified', async () => {
+  const repo = tmp('closed');
+  fs.mkdirSync(path.join(repo, '.claude', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'pod', 'project.yml'), example()
+    .replace('repo: owner/name', 'repo: acme/app').replace('type: manual ', 'type: claude-cloud ')
+    .replace(/^# tasks: .*$/m, `tasks: {${ROLE_NAMES.map((r) => `${r}: task_${r}`).join(', ')}}`));
+  fs.writeFileSync(path.join(repo, 'packet.md'), '- **Goal:** g\n');
+  const env = { FORGE_POD_HOME: tmp('home') };
+  const lines = [];
+  const run = (args, gh) => { lines.length = 0; return main(args, { cwd: repo, env, out: (l) => lines.push(l), transport: gh.transport }); };
+  const handoff = ['handoff', 'engineer', '--packet', 'packet.md', '--from', 'pm'];
+
+  const gh = fakeGithub({ issues: { 1: [BUILD], 2: [BUILD], 3: [BUILD], 4: ['pod: ready'] } });
+  assert.equal(await run([...handoff, '--item', '4'], gh), EXIT.refused);
+  assert.match(lines.join('\n'), /Handoff refused: engineer limit reached \(3\/3\)/);
+  assert.doesNotMatch(lines.join('\n'), /task_engineer/, 'a refused handoff must not reveal the task to fire');
+
+  assert.equal(await run(handoff, gh), EXIT.unverified, 'no --item: nothing to count on');
+  gh.fail = 'HTTP 502';
+  assert.equal(await run([...handoff, '--item', '4'], gh), EXIT.unverified);
+  assert.match(lines.join('\n'), /limits could not be verified on the tracker ledger \(HTTP 502\)/);
+  assert.doesNotMatch(lines.join('\n'), /task_engineer/);
+  assert.equal(await run(['status', 'engineer', 'working', '--item', '4'], gh), EXIT.unverified, 'a role cannot start if pause is unreadable');
+  gh.fail = null;
+
+  // Dry run reports the verdict and writes nothing.
+  assert.equal(await run([...handoff, '--item', '4', '--dry-run'], gh), EXIT.ok);
+  assert.match(lines.join('\n'), /would be refused: engineer limit reached/);
+  assert.ok(!gh.calls.some((c) => !c.startsWith('GET')), 'no write reached the tracker');
+
+  // Accepted: recorded on the item, then the task is named.
+  gh.issues.get('3').labels = ['pod: needs-human'];
+  assert.equal(await run([...handoff, '--item', '4'], gh), EXIT.ok);
+  assert.match(lines.join('\n'), /Fire scheduled task task_engineer/);
+  assert.match(gh.comments.at(-1).body, /pod:handoff from=pm to=engineer/);
+  assert.deepEqual(gh.issues.get('4').labels, [BUILD]);
+
+  // Paused on the tracker: handoffs and role starts both stop.
+  gh.issues.get('1').labels.push('pod: paused');
+  assert.equal(await run(['handoff', 'reviewer', '--packet', 'packet.md', '--from', 'engineer', '--item', '4'], gh), EXIT.refused);
+  assert.equal(await run(['status', 'pm', 'working'], gh), EXIT.refused);
+  assert.match(lines.join('\n'), /the pod is paused/);
+});
+
+// In-memory Jira REST double covering the calls the ledger makes.
+function fakeJira(issues) {
+  const db = { issues: new Map(Object.entries(issues).map(([k, status]) => [k, { status, comments: [] }])), tick: 0 };
+  const stamp = () => new Date(Date.now() + ++db.tick).toISOString().replace('Z', '+0000');
+  db.transport = async ({ method = 'GET', path: p, query = {}, body }) => {
+    if (p === '/rest/api/3/search/jql') {
+      assert.match(query.jql, /^project = "ABC" AND /);
+      const status = query.jql.match(/status = "([^"]+)"/)?.[1];
+      return { issues: [...db.issues].filter(([, i]) => !status || i.status === status).map(([key]) => ({ key })) };
+    }
+    const [, key, what] = p.match(/^\/rest\/api\/2\/issue\/([^/]+)\/(comment|transitions)$/);
+    const issue = db.issues.get(key);
+    if (what === 'comment' && method === 'GET') return { comments: issue.comments };
+    if (what === 'comment') { const c = { body: body.body, created: stamp() }; issue.comments.push(c); return c; }
+    if (method === 'GET') return { transitions: (db.transitions || ['In Progress', 'Ready']).map((name, id) => ({ id: String(id), to: { name } })) };
+    issue.status = (db.transitions || ['In Progress', 'Ready'])[Number(body.transition.id)];
+    return null;
+  };
+  return db;
+}
+
+test('the same limits bind through the jira ledger', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...WORK, runtime: { type: 'copilot-cli', where: 'actions' }, limits: { engineers: 2, round_trips: 1, daily_sessions: { tester: 1 } } });
+  const jira = fakeJira({ 'ABC-1': 'In Progress', 'ABC-2': 'In Progress', 'ABC-3': 'Ready', 'ABC-4': 'Ready' });
+  const ledger = openLedger(cfg, { env, transport: jira.transport });
+
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: 'ABC-3', from: 'pm' }, env), /engineer limit reached \(2\/2\)/);
+  jira.issues.get('ABC-2').status = 'In Review';
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'ABC-3', from: 'pm' }, env), null);
+  assert.equal(jira.issues.get('ABC-3').status, 'In Progress', 'moved by a workflow transition');
+  assert.equal(jira.issues.get('ABC-3').comments[0].body, '[pod:handoff from=pm to=engineer]');
+
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'ABC-3', from: 'reviewer' }, env), null);
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: 'ABC-3', from: 'tester' }, env), /round-trip limit reached for ABC-3 \(1\/1\)/);
+
+  assert.equal(await claimHandoff(ledger, cfg, 'tester', { item: 'ABC-3', from: 'engineer' }, env), null);
+  assert.match(await claimHandoff(ledger, cfg, 'tester', { item: 'ABC-1', from: 'engineer' }, env), /daily session cap reached for tester \(1\/1\)/);
+
+  jira.issues.get('ABC-4').status = 'On Hold';
+  assert.match(await checkHandoff(ledger, cfg, 'reviewer', { item: 'ABC-1', from: 'engineer' }, env), /paused/);
+  jira.issues.get('ABC-4').status = 'Ready';
+
+  // A workflow without the needed transition is an error, never a silent pass.
+  jira.issues.get('ABC-2').status = 'Done';
+  jira.issues.get('ABC-1').status = 'Done';
+  jira.issues.get('ABC-3').status = 'Done';
+  jira.transitions = ['Ready'];
+  await assert.rejects(() => claimHandoff(ledger, cfg, 'engineer', { item: 'ABC-4', from: 'pm' }, env), /no workflow transition to 'In Progress'/);
+  // And without credentials the real transport refuses rather than guessing.
+  await assert.rejects(() => openLedger(cfg, { env: {} }).paused(), /Jira credentials missing/);
+});
+
+test('a persistent machine may keep its ledger on disk, with the same guards', async () => {
   const env = { FORGE_POD_STATE: tmp('state') };
   const cfg = contract({ limits: { engineers: 2, round_trips: 2, daily_sessions: { pm: 1 } } });
-  assert.equal(handoffGuards(cfg, 'engineer', { item: 'A' }, env), null);
+  const ledger = openLedger(cfg, { env });
+  assert.equal(ledger.kind, 'local');
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'A' }, env), null);
   appendStatus(cfg, { role: 'engineer', state: 'working', item: 'A' }, env);
   appendStatus(cfg, { role: 'engineer', state: 'working', item: 'B' }, env);
-  assert.match(handoffGuards(cfg, 'engineer', { item: 'C' }, env), /engineer limit reached \(2\/2\)/);
-  assert.equal(handoffGuards(cfg, 'engineer', { item: 'A', from: 'reviewer' }, env), null, 'rework on an item already in build is not a new engineer');
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: 'C' }, env), /engineer limit reached \(2\/2\)/);
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'A', from: 'reviewer' }, env), null, 'rework holds its slot');
   appendStatus(cfg, { role: 'engineer', state: 'done', item: 'B' }, env);
-  assert.equal(handoffGuards(cfg, 'engineer', { item: 'C' }, env), null);
-
-  appendStatus(cfg, { event: 'handoff', role: 'reviewer', to: 'engineer', item: 'A' }, env);
-  appendStatus(cfg, { event: 'handoff', role: 'tester', to: 'engineer', item: 'A' }, env);
-  assert.match(handoffGuards(cfg, 'engineer', { item: 'A', from: 'reviewer' }, env), /round-trip limit reached for A \(2\/2\)/);
-
-  assert.equal(handoffGuards(cfg, 'pm', {}, env), null);
-  appendStatus(cfg, { event: 'handoff', role: 'sre', to: 'pm' }, env);
-  assert.match(handoffGuards(cfg, 'pm', {}, env), /daily session cap reached for pm/);
-
+  assert.equal(await checkHandoff(ledger, cfg, 'engineer', { item: 'C' }, env), null);
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'A', from: 'tester' }, env), null);
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: 'A', from: 'reviewer' }, env), /round-trip limit reached for A \(2\/2\)/);
+  assert.equal(await claimHandoff(ledger, cfg, 'pm', { from: 'sre' }, env), null);
+  assert.match(await claimHandoff(ledger, cfg, 'pm', { from: 'sre' }, env), /daily session cap reached for pm/);
   fs.writeFileSync(path.join(env.FORGE_POD_STATE, 'PAUSED'), 'x');
-  assert.match(handoffGuards(cfg, 'reviewer', {}, env), /paused/);
-  assert.equal(readStatus(cfg, env).length, 6);
+  assert.match(await claimHandoff(ledger, cfg, 'reviewer', {}, env), /paused/);
+});
+
+// ---------- project root ----------
+
+test('the project is found from any directory inside it, and paths stay root-relative', async () => {
+  const repo = fs.realpathSync(tmp('root'));
+  const env = { FORGE_POD_HOME: tmp('home') };
+  fs.mkdirSync(path.join(repo, '.git'));
+  const nested = path.join(repo, 'packages', 'app', 'src');
+  fs.mkdirSync(nested, { recursive: true });
+  assert.equal(findProject(nested, env), null);
+
+  const lines = [];
+  const run = (args, cwd = nested) => { lines.length = 0; return main(args, { cwd, env, out: (l) => lines.push(l) }); };
+  assert.equal(await run(['init', '--host', 'copilot']), 0, 'init from a subdirectory writes at the repository root');
+  const contractFile = path.join(repo, '.github', 'pod', 'project.yml');
+  assert.ok(fs.existsSync(contractFile));
+  assert.match(fs.readFileSync(contractFile, 'utf8'), new RegExp(`^project: ${path.basename(repo).toLowerCase()}$`, 'm'));
+  assert.deepEqual(findProject(nested, env), { root: repo, config: contractFile });
+  assert.equal(findConfig(nested, env), contractFile);
+  assert.equal(await run(['doctor']), 0);
+  assert.match(lines.join('\n'), new RegExp(`root: ${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n`));
+
+  fs.writeFileSync(contractFile, fs.readFileSync(contractFile, 'utf8')
+    .replace('type: manual ', 'type: copilot-cli ').replace('  # where: local ', '  where: actions # '));
+  fs.writeFileSync(path.join(nested, 'packet.md'), '- **Goal:** g\n');
+  assert.equal(await run(['handoff', 'reviewer', '--packet', 'packet.md', '--item', '7', '--dry-run', '--foreground']), 0);
+  const fromNested = lines.join('\n');
+  assert.equal(await run(['handoff', 'reviewer', '--packet', path.join(nested, 'packet.md'), '--item', '7', '--dry-run', '--foreground'], repo), 0);
+  assert.equal(fromNested, lines.join('\n'), 'the same handoff whatever directory it is started from');
+  assert.doesNotMatch(fromNested, /\.\.\//, 'no path climbs out of a subdirectory');
+
+  assert.equal(await run(['workflows']), 0);
+  assert.ok(fs.existsSync(path.join(repo, '.github', 'workflows', 'pod-pm.yml')), 'workflows land at the root');
+  assert.ok(!fs.existsSync(path.join(nested, '.github')));
+});
+
+test('an installed pod script knows its own project from where it sits', () => {
+  const repo = fs.realpathSync(tmp('installed'));
+  const elsewhere = tmp('elsewhere');
+  const opts = { home: repo, project: repo, role: 'pod' };
+  for (const a of planInstall('claude', opts).actions) writeFileSafe(a.path, a.content, { apply: true, mode: a.mode });
+  fs.mkdirSync(path.join(repo, '.claude', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'pod', 'project.yml'), example());
+  const script = path.join(repo, '.claude', 'forge', 'pod', 'pod.mjs');
+  const env = { ...process.env, FORGE_POD_HOME: tmp('home') };
+  delete env.FORGE_POD_CONFIG;
+  for (const cwd of [elsewhere, path.join(repo, '.claude', 'forge')]) {
+    const res = spawnSync(process.execPath, [script, 'doctor'], { cwd, env, encoding: 'utf8' });
+    assert.equal(res.status, 0, res.stderr + res.stdout);
+    assert.match(res.stdout, new RegExp(`root: ${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n`));
+  }
+  fs.writeFileSync(path.join(elsewhere, 'p.md'), 'x\n');
+  const res = spawnSync(process.execPath, [script, 'handoff', 'reviewer', '--packet', 'p.md', '--dry-run'], { cwd: elsewhere, env, encoding: 'utf8' });
+  assert.match(res.stdout, /read: \.claude\/forge\/pod\/protocol\.md, \.claude\/forge\/pod\/roles\/reviewer\.md/);
+});
+
+test('an out-of-repo contract is found from a subdirectory, keyed by the repository name', () => {
+  const repo = fs.realpathSync(tmp('clean'));
+  const home = tmp('home');
+  fs.mkdirSync(path.join(repo, '.git'));
+  const nested = path.join(repo, 'a', 'b');
+  fs.mkdirSync(nested, { recursive: true });
+  const outside = path.join(home, path.basename(repo).toLowerCase(), 'project.yml');
+  fs.mkdirSync(path.dirname(outside), { recursive: true });
+  fs.writeFileSync(outside, example());
+  assert.deepEqual(findProject(nested, { FORGE_POD_HOME: home }), { root: repo, config: outside });
+  assert.deepEqual(findProject(nested, { FORGE_POD_CONFIG: outside, FORGE_POD_ROOT: repo }), { root: repo, config: outside });
+  const inRepo = path.join(repo, '.claude', 'pod', 'project.yml');
+  assert.equal(findProject(tmp('x'), { FORGE_POD_CONFIG: inRepo }).root, repo, 'root derived from an in-repo contract path');
 });
 
 // ---------- CLI ----------

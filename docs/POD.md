@@ -42,6 +42,8 @@ node bin/forge.mjs install claude --profile pod --project .      # into the repo
 node bin/forge.mjs install copilot --profile pod                 # into your home (~/.copilot/)
 ```
 
+The pod CLI finds its project from any directory inside the repository (an installed copy knows its own project from where it sits), and every path it prints or runs is relative to the repository root.
+
 `--project <path>` installs into the repository with repo-relative paths, so a cloud session or CI runner that clones the repo fresh has everything. It is supported for `claude` (`.claude/`) and `copilot` (`.github/`). Without it, Forge installs into your home directory as it always has.
 
 When a contract exists, a project install includes only the tracker, docs, and runtime notes that contract selects. Pass the same `--profile` (and `--project`) to `update` and `uninstall`.
@@ -88,8 +90,16 @@ Override one role with `models: { engineer: deep }` or a model name. Agent files
 
 - Roles are deny-by-default: only what the contract lists under `allowed`. `merge` and `push_default_branch` must be under `never`; `pod doctor` fails otherwise.
 - A change touching `risk_paths` goes through the architect, uses the `deep` tier, and states risk and rollback.
-- Limits: concurrent engineers, review round trips, and optional daily sessions per role. Past a limit the item becomes `blocked` and goes to the EM. `pod handoff` enforces these where the status log persists (a local machine); elsewhere roles count on the tracker.
-- `pod pause` stops handoffs. On hosted runtimes also disable the role tasks or workflows; the command tells you which.
+- Limits: concurrent engineers, review round trips, and optional daily sessions per role. Past a limit the handoff is refused, the item becomes `blocked`, and it goes to the EM.
+- **Limits are enforced by `pod handoff` from a ledger, not by the roles.** The command is the only writer: it records each handoff before it starts a role and counts before it records.
+  - On hosted runtimes (`claude-cloud`, `copilot-cli` on `actions`) the ledger is the tracker: a marker comment on the work item per handoff, plus the items' states. A cloud session or CI runner starts on an empty machine, so nothing local could hold the count. `pod doctor` rejects `limits.ledger: local` there.
+  - On `copilot-cli` local and `manual` the ledger defaults to the status log on that machine; set `limits.ledger: tracker` to share one count across machines.
+  - GitHub is reached through `gh api`; Jira through its REST API with `JIRA_URL`, `ATLASSIAN_EMAIL`, `ATLASSIAN_API_TOKEN`.
+  - **Fail closed:** if the ledger cannot be read or written, or `--item` is missing on a tracker ledger, the handoff is refused (exit 4). There is no override.
+  - **Races:** a handoff to the engineer claims its slot, moves the item into build, then re-reads. If two claims overshoot the limit, the tracker's comment timestamps decide and the later one withdraws.
+  - Engineer slots are counted as open work items in the `in_progress` state, so an item a person moves there by hand also holds a slot.
+- **Pause:** `pod pause` stops handoffs on this machine. On a tracker ledger the pause is any open work item in the `paused` state; every handoff and every role start (`pod status <role> working`) checks it. Disable the role tasks or workflows as well to stop scheduled starts.
+- What this does not stop: a role that never calls `pod handoff` and starts another role some other way. On Copilot CLI the deny rules limit what such a role can do; on Claude cloud the controls left are the task permissions you grant and branch protection. The Jira ledger is covered by tests against a fake server only; check it against your site before relying on it.
 - Text from work items, change requests, and web pages is treated as data, not instructions.
 - No data connectors unless the contract lists them.
 
@@ -108,6 +118,8 @@ forge pod handoff <role> --packet <file|-> [--item <id>] [--from <role>] [--dry-
 forge pod status <role> <working|idle|blocked|waiting|done> [--item <id>] [--note <text>]
 forge pod board [--out <file>] | workflows [--out <dir>] | pause | resume
 ```
+
+`handoff` exits 0 when the role was started, 2 when the contract has no task for it, 3 when a limit or pause refused it, and 4 when the limits could not be verified.
 
 An installed pod carries its own copy of this CLI at `<host folder>/forge/pod/pod.mjs`, with no dependency on the Forge checkout.
 

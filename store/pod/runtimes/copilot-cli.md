@@ -9,4 +9,5 @@ Each role is a custom agent. A handoff starts the next role as a non-interactive
 - **Model:** passed from the contract's tiers when one is set; otherwise the CLI's default.
 - **Deny rules are the control, instructions are the backup.** If the handoff command warns that a `never` entry has no tool pattern, that entry is only enforced by this text. Treat it as forbidden all the same.
 - **Status:** `local` keeps the status log on this machine. On `actions` the log does not persist, so also post a one-line status comment on the work item at start and end.
-- **Pause:** the pod `pause` command on this machine, or disabled workflows, mean stop.
+- **Limits:** on `actions` they are counted on the tracker by the handoff command, because a runner starts empty; if the tracker cannot be reached, the handoff is refused. On `local` they are counted from this machine's status log unless the contract sets `limits.ledger: tracker`.
+- **Pause:** the pod `pause` command on this machine; on `actions`, any open work item in the tracker's `paused` state. Disabling the workflows stops scheduled starts as well.
