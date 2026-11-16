@@ -6,6 +6,12 @@
       "title": "Staff Engineer",
       "description": "Code delivery at a staff-engineer bar: bounded implement -> review -> refine, with lazy architect/SME escalation.",
       "agents": ["forge", "implementer", "reviewer", "architect", "sme-security", "sme-performance", "sme-domain", "sme-a11y"]
+    },
+    "pod": {
+      "title": "Engineering Pod",
+      "description": "Independent role agents (PM, UX, architect, engineer, reviewer, tester, SRE, EM) that hand work to each other through the project's tracker. Opt-in: install with --profile pod. Includes everything in the engineer profile.",
+      "pod": true,
+      "agents": ["forge", "implementer", "reviewer", "architect", "sme-security", "sme-performance", "sme-domain", "sme-a11y", "pm", "ux", "tester", "sre", "em"]
     }
   }
 }

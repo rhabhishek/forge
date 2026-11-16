@@ -15,16 +15,43 @@ import { applyUpdatePlans, planUpdate } from '../lib/update.mjs';
 import { mergeMcp, mcpTargets, loadMcpCatalog } from '../lib/mcp.mjs';
 import { persistCredentials, IS_MAC, IS_WIN } from '../lib/secrets.mjs';
 import { confirm, text, isTTY } from '../lib/prompt.mjs';
+import { main as podMain, findConfig, loadConfig } from '../lib/pod.mjs';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
 const apply = args.includes('--apply');
 const resetTools = args.includes('--reset-tools');
-const positional = args.filter((a) => !a.startsWith('--'));
+const VALUE_FLAGS = ['--project', '--profile'];
+const flagValue = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const positional = args.filter((a, i) => !a.startsWith('--') && !VALUE_FLAGS.includes(args[i - 1]));
 const tool = positional[1];
+// --project <path>: install into that repository (committed, repo-relative
+// paths) instead of the user's home. --profile <name>: which agent set.
+const projectDir = flagValue('--project') ? path.resolve(flagValue('--project')) : null;
+const profileName = flagValue('--profile');
+// Paths are printed relative to wherever this run writes.
+const ROOT = projectDir || HOME;
 
 function tools() {
-  return tool && tool !== 'all' ? [tool] : adapterNames();
+  if (tool && tool !== 'all') return [tool];
+  // A project install targets one host; never fan out across all of them.
+  if (projectDir) throw new Error('--project needs an explicit tool, e.g. `forge install claude --project .`');
+  return adapterNames();
+}
+
+// Options shared by install / update / uninstall. For a pod install the
+// project's contract (when one exists) selects which tracker, docs, and runtime
+// notes are installed.
+function planOptions() {
+  const opts = { home: ROOT, role: profileName };
+  if (!projectDir) return opts;
+  opts.project = projectDir;
+  const contract = findConfig(projectDir, {});
+  if (contract) {
+    const { cfg } = loadConfig(contract);
+    opts.pod = { tracker: cfg.tracker.type, docs: cfg.docs.type, runtime: cfg.runtime.type };
+  }
+  return opts;
 }
 
 function usage() {
@@ -49,6 +76,15 @@ Usage:
   forge uninstall [tool|all] [--apply]  Remove Forge files from a tool
   forge doctor                          Check the store is well-formed and what's installed
   forge leak-check                      Scan the store for company/PII data before sharing
+
+Options for install / update / uninstall:
+  --profile <name>                      Agent set to install (default: engineer). 'pod' adds the pod roles.
+  --project <path>                      Install into that repository instead of your home, with repo-relative
+                                        paths, for cloud sessions and CI runners. Needs an explicit tool.
+
+Pod (independent role agents that hand work to each other; see docs/POD.md):
+  forge pod init|config|doctor|roles|handoff|status|board|workflows|pause|resume
+                                        Run \`forge pod help\` for details.
 
 Memory (canonical store at ~/.forge/memory, never written into your repo):
   forge mem path                        Print the memory dir for the current project
@@ -105,30 +141,32 @@ function doRemember() {
 
 async function doInstall() {
   for (const t of tools()) {
-    const { base, actions, label } = planInstall(t, { home: HOME, resetTools });
+    const { base, actions, label } = planInstall(t, { ...planOptions(), resetTools });
     console.log(`\n${label} -> ${base}`);
     if (fs.existsSync(manifestPath(base))) {
-      const plan = planUpdate(t, { home: HOME, resetTools });
+      const plan = planUpdate(t, { ...planOptions(), resetTools });
       for (const entry of plan.entries) {
-        console.log(`  [${entry.status}] ${path.relative(HOME, entry.target)}${entry.reason ? ` (${entry.reason})` : ''}`);
+        console.log(`  [${entry.status}] ${path.relative(ROOT, entry.target)}${entry.reason ? ` (${entry.reason})` : ''}`);
       }
       if (apply) {
         applyUpdatePlans([plan]);
-        console.log(`  [manifest] ${path.relative(HOME, manifestPath(base))}`);
+        console.log(`  [manifest] ${path.relative(ROOT, manifestPath(base))}`);
       }
       continue;
     }
     for (const a of actions) {
       const status = writeFileSafe(a.path, a.content, { apply, mode: a.mode });
-      console.log(`  [${status}] ${path.relative(HOME, a.path)}`);
+      console.log(`  [${status}] ${path.relative(ROOT, a.path)}`);
     }
     if (apply) {
       writeManifest(t, base, actions);
-      console.log(`  [manifest] ${path.relative(HOME, manifestPath(base))}`);
+      console.log(`  [manifest] ${path.relative(ROOT, manifestPath(base))}`);
     }
   }
   if (!apply) { console.log('\nDry run. Re-run with --apply to write files.'); return; }
-  await maybeRunWizard();
+  // The wizard provisions per-user credentials and MCP servers; a project
+  // install is committed to a repository and must not trigger it.
+  if (!projectDir) await maybeRunWizard();
 }
 
 // After file install, offer the guided wizard once (credentials + MCP servers).
@@ -149,11 +187,11 @@ async function maybeRunWizard() {
 }
 
 function doUpdate() {
-  const plans = tools().map((selectedTool) => planUpdate(selectedTool, { home: HOME }));
+  const plans = tools().map((selectedTool) => planUpdate(selectedTool, planOptions()));
   for (const plan of plans) {
     console.log(`\n${plan.label} -> ${plan.base}`);
     for (const entry of plan.entries) {
-      console.log(`  [${entry.status}] ${path.relative(HOME, entry.target)}${entry.reason ? ` (${entry.reason})` : ''}`);
+      console.log(`  [${entry.status}] ${path.relative(ROOT, entry.target)}${entry.reason ? ` (${entry.reason})` : ''}`);
     }
   }
   if (!apply) {
@@ -166,7 +204,7 @@ function doUpdate() {
 
 function doUninstall() {
   for (const t of tools()) {
-    const { base, actions, from } = uninstallActions(t, { home: HOME });
+    const { base, actions, from } = uninstallActions(t, planOptions());
     console.log(`\n${t} (${from === 'manifest' ? 'from install manifest' : 'no manifest - replanned from current store'}):`);
     for (const a of actions) {
       if (!apply) {
@@ -175,13 +213,13 @@ function doUninstall() {
           status = fs.existsSync(a.path + '.forge-bak') ? 'would-restore-backup'
             : a.mode === 'managed' ? 'would-remove-block' : 'would-remove';
         }
-        console.log(`  [${status}] ${path.relative(HOME, a.path)}`);
+        console.log(`  [${status}] ${path.relative(ROOT, a.path)}`);
         continue;
       }
       let status;
       try { status = removeInstalledFile(a.path, a.mode); }
       catch (e) { status = `error: ${e.message}`; process.exitCode = 1; }
-      console.log(`  [${status}] ${path.relative(HOME, a.path)}`);
+      console.log(`  [${status}] ${path.relative(ROOT, a.path)}`);
       if (status === 'removed') pruneEmptyParents(a.path, base);
     }
     if (apply) fs.rmSync(manifestPath(base), { force: true });
@@ -390,6 +428,7 @@ async function main() {
     case 'leak-check': doLeakCheck(); break;
     case 'mem': doMem(); break;
     case 'remember': doRemember(); break;
+    case 'pod': process.exitCode = await podMain(args.slice(1)); break;
     default: usage();
   }
 }

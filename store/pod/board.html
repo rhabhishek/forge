@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pod Board</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --surface: #ffffff; --ink: #1d1c1a; --muted: #6b6860; --line: #e2dfd6;
+    --working: #1f7a4d; --idle: #8a877e; --blocked: #b3261e; --waiting: #9a6700; --done: #3a5ba0;
+    --accent: #3a5ba0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161614; --surface: #201f1c; --ink: #ecebe6; --muted: #a09d94; --line: #33312c;
+      --working: #5fcf95; --idle: #8f8c83; --blocked: #ff8a80; --waiting: #e3b341; --done: #8fb0f0;
+      --accent: #8fb0f0;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161614; --surface: #201f1c; --ink: #ecebe6; --muted: #a09d94; --line: #33312c;
+    --working: #5fcf95; --idle: #8f8c83; --blocked: #ff8a80; --waiting: #e3b341; --done: #8fb0f0;
+    --accent: #8fb0f0;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 20px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 28px 0 10px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .banner { background: var(--blocked); color: var(--bg); padding: 8px 12px; border-radius: 8px; font-weight: 600; margin-bottom: 16px; }
+  .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .card h3 { margin: 0 0 2px; font-size: 15px; }
+  .state { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  .s-working { color: var(--working); } .s-idle { color: var(--idle); } .s-blocked { color: var(--blocked); }
+  .s-waiting { color: var(--waiting); } .s-done { color: var(--done); }
+  .small { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .item { font-weight: 600; overflow-wrap: anywhere; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 14px; vertical-align: top; overflow-wrap: anywhere; }
+  thead th { border-top: 0; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .scroll { overflow-x: auto; }
+  .empty { color: var(--muted); padding: 12px 14px; background: var(--surface); border: 1px dashed var(--line); border-radius: 10px; }
+  .dials { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+  .dials b { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1 id="title">Pod Board</h1><span class="meta" id="generated"></span></header>
+  <div id="paused"></div>
+  <h2>Waiting on you</h2><div id="queue"></div>
+  <h2>Agents</h2><div class="grid" id="lanes"></div>
+  <h2>Work in flight</h2><div id="items"></div>
+  <h2>Handoffs</h2><div id="timeline"></div>
+  <h2>Limits</h2><div class="card dials" id="dials"></div>
+</main>
+<script>
+const DATA = /*__POD_DATA__*/null;
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+  const empty = (text) => el('div', 'empty', text);
+  if (!DATA) { $('lanes').append(empty('No data. Generate this page with the pod board command.')); return; }
+
+  const ago = (ts) => {
+    const mins = Math.max(0, Math.round((new Date(DATA.generated) - new Date(ts)) / 60000));
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min';
+    if (mins < 1440) return Math.round(mins / 60) + ' h';
+    return Math.round(mins / 1440) + ' d';
+  };
+  const stateBadge = (state) => { const s = el('span', 'state s-' + state); s.append(el('span', 'dot'), document.createTextNode(state)); return s; };
+
+  $('title').textContent = DATA.project + ' pod';
+  $('generated').textContent = 'as of ' + new Date(DATA.generated).toLocaleString();
+  if (DATA.paused) $('paused').append(el('div', 'banner', 'Pod is paused. No handoffs will start.'));
+
+  const rows = DATA.rows || [];
+  const statusRows = rows.filter((r) => r.event !== 'handoff' && r.role);
+  const handoffs = rows.filter((r) => r.event === 'handoff');
+
+  // Latest status per role, and per (role, item).
+  const byRole = new Map(), byWork = new Map();
+  for (const r of statusRows) { byRole.set(r.role, r); byWork.set(r.role + '\u0000' + (r.item || ''), r); }
+
+  // Agent lanes
+  for (const role of DATA.roles) {
+    const last = byRole.get(role.role);
+    const card = el('div', 'card');
+    card.append(el('h3', null, role.title));
+    card.append(stateBadge(last ? (last.state === 'done' ? 'idle' : last.state) : 'idle'));
+    if (last && last.item && last.state !== 'done') card.append(el('div', 'item', last.item));
+    if (last && last.note) card.append(el('div', 'small', last.note));
+    card.append(el('div', 'small', (role.model || role.tier + ' tier') + (last ? ' · ' + ago(last.ts) + ' in state' : ' · no activity yet')));
+    const sessionsToday = handoffs.filter((h) => h.to === role.role && String(h.ts).slice(0, 10) === DATA.generated.slice(0, 10)).length;
+    const cap = (DATA.limits.daily_sessions || {})[role.role];
+    card.append(el('div', 'small', sessionsToday + ' session' + (sessionsToday === 1 ? '' : 's') + ' today' + (cap ? ' of ' + cap : '')));
+    $('lanes').append(card);
+  }
+
+  // Work in flight + the human's queue
+  const active = [...byWork.values()].filter((r) => r.item && r.state !== 'done');
+  const waiting = active.filter((r) => r.state === 'waiting' || r.state === 'blocked');
+  const table = (list, cols) => {
+    const wrap = el('div', 'scroll'), t = el('table'), head = el('thead'), hr = el('tr'), body = el('tbody');
+    cols.forEach((c) => hr.append(el('th', null, c[0]))); head.append(hr);
+    list.forEach((r) => { const tr = el('tr'); cols.forEach((c) => { const td = el('td'); const v = c[1](r); td.append(v instanceof Node ? v : document.createTextNode(v == null ? '' : v)); tr.append(td); }); body.append(tr); });
+    t.append(head, body); wrap.append(t); return wrap;
+  };
+  const trips = (item) => handoffs.filter((h) => h.item === item && h.to === 'engineer' && (h.role === 'reviewer' || h.role === 'tester')).length;
+  $('queue').append(waiting.length
+    ? table(waiting, [['Item', (r) => r.item], ['State', (r) => stateBadge(r.state)], ['From', (r) => r.role], ['Waiting', (r) => ago(r.ts)], ['Note', (r) => r.note]])
+    : empty('Nothing is waiting on you.'));
+  $('items').append(active.length
+    ? table(active, [['Item', (r) => r.item], ['With', (r) => r.role], ['State', (r) => stateBadge(r.state)], ['For', (r) => ago(r.ts)], ['Round trips', (r) => trips(r.item) + ' of ' + DATA.limits.round_trips]])
+    : empty('No work in flight.'));
+
+  // Handoff timeline, newest first
+  const recent = handoffs.slice(-25).reverse();
+  $('timeline').append(recent.length
+    ? table(recent, [['When', (h) => (ago(h.ts) === 'just now' ? 'just now' : ago(h.ts) + ' ago')], ['From', (h) => h.role || 'human'], ['To', (h) => h.to], ['Item', (h) => h.item]])
+    : empty('No handoffs yet.'));
+
+  // Dials
+  const building = active.filter((r) => r.role === 'engineer' && r.state === 'working').length;
+  const dial = (label, value) => { const d = el('div'); d.append(document.createTextNode(label + ' '), el('b', null, value)); return d; };
+  $('dials').append(
+    dial('Engineers building', building + ' of ' + DATA.limits.engineers),
+    dial('Round trips allowed', String(DATA.limits.round_trips)),
+    dial('Handoffs today', String(handoffs.filter((h) => String(h.ts).slice(0, 10) === DATA.generated.slice(0, 10)).length)),
+    dial('Pod', DATA.paused ? 'paused' : 'running'));
+})();
+</script>
+</body>
+</html>
