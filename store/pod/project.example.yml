@@ -69,6 +69,8 @@ limits:
   engineers: 3
   round_trips: 3
   # daily_sessions: {pm: 4, em: 12}
+  # claim_timeout_minutes: 30   # local ledger: how long a handoff to the engineer holds a slot
+  #                             # before the engineer has reported `working`
   # ledger: tracker          # where limits are counted. Hosted runtimes (claude-cloud, copilot-cli on
   #                          # actions) always use the tracker; local and manual default to this machine.
 

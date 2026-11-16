@@ -16,7 +16,7 @@ import { planUpdate } from '../lib/update.mjs';
 import {
   ROLE_NAMES, ROLES, BASELINE_NEVER, parseYaml, normalizeConfig, validateConfig, loadConfig,
   findConfig, findProject, planHandoff, appendStatus, readStatus, allDenyPatterns, modelFor,
-  renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, ledgerKind, EXIT,
+  renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, ledgerKind, localBuilds, EXIT,
 } from '../lib/pod.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `forge-pod-${name}-`));
@@ -553,6 +553,7 @@ test('a persistent machine may keep its ledger on disk, with the same guards', a
   const cfg = contract({ limits: { engineers: 2, round_trips: 2, daily_sessions: { pm: 1 } } });
   const ledger = openLedger(cfg, { env });
   assert.equal(ledger.kind, 'local');
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', {}, env), /--item is required/);
   assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'A' }, env), null);
   appendStatus(cfg, { role: 'engineer', state: 'working', item: 'A' }, env);
   appendStatus(cfg, { role: 'engineer', state: 'working', item: 'B' }, env);
@@ -566,6 +567,70 @@ test('a persistent machine may keep its ledger on disk, with the same guards', a
   assert.match(await claimHandoff(ledger, cfg, 'pm', { from: 'sre' }, env), /daily session cap reached for pm/);
   fs.writeFileSync(path.join(env.FORGE_POD_STATE, 'PAUSED'), 'x');
   assert.match(await claimHandoff(ledger, cfg, 'reviewer', {}, env), /paused/);
+});
+
+test('on the local ledger a handoff reserves the engineer slot before the engineer starts', async () => {
+  const env = { FORGE_POD_STATE: tmp('state') };
+  const cfg = contract({ limits: { engineers: 2 } });
+  const ledger = openLedger(cfg, { env });
+  // Nobody has reported `working`: the handoffs themselves must hold the slots.
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'A', from: 'pm' }, env), null);
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'B', from: 'pm' }, env), null);
+  assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: 'C', from: 'pm' }, env), /engineer limit reached \(2\/2\)/);
+  assert.equal(readStatus(cfg, env).length, 2, 'the refused handoff recorded nothing');
+
+  // Reporting `working` keeps the slot; any other status frees it.
+  appendStatus(cfg, { role: 'engineer', state: 'working', item: 'A' }, env);
+  assert.match(await checkHandoff(ledger, cfg, 'engineer', { item: 'C' }, env), /limit reached/);
+  appendStatus(cfg, { role: 'engineer', state: 'done', item: 'A' }, env);
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: 'C', from: 'pm' }, env), null);
+
+  // A reservation whose engineer never started lapses; one that is working does not.
+  const old = new Date(Date.now() - 31 * 60000).toISOString();
+  const rows = [
+    { ts: old, event: 'handoff', to: 'engineer', item: 'X' },
+    { ts: old, event: 'handoff', to: 'engineer', item: 'Y' },
+    { ts: old, role: 'engineer', state: 'working', item: 'Y' },
+    { ts: new Date().toISOString(), event: 'handoff', to: 'engineer', item: 'Z' },
+    { ts: new Date().toISOString(), event: 'release', to: 'engineer', item: 'Z' },
+  ];
+  assert.deepEqual(localBuilds(rows, cfg), ['Y']);
+  assert.deepEqual(localBuilds(rows, contract({ limits: { claim_timeout_minutes: 60 } })).sort(), ['X', 'Y']);
+});
+
+test('interleaved local handoffs cannot both take the last engineer slot', async () => {
+  // Eight claims started together interleave at every await: without the lock
+  // each one reads the ledger before any of them has written to it.
+  const env = { FORGE_POD_STATE: tmp('state') };
+  const cfg = contract({ limits: { engineers: 2 } });
+  const results = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+    claimHandoff(openLedger(cfg, { env }), cfg, 'engineer', { item: `ITEM-${i}`, from: 'pm' }, env)));
+  assert.equal(results.filter((r) => r === null).length, 2, JSON.stringify(results));
+  assert.equal(results.filter((r) => /engineer limit reached \(2\/2\)/.test(r || '')).length, 6);
+  assert.equal(readStatus(cfg, env).filter((r) => r.event === 'handoff').length, 2);
+});
+
+test('concurrent local handoffs from separate processes never exceed the engineer limit', async () => {
+  const repo = tmp('concurrent');
+  fs.mkdirSync(path.join(repo, '.github', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.github', 'pod', 'project.yml'), example().replace(/engineers: 3/, 'engineers: 2'));
+  fs.writeFileSync(path.join(repo, 'packet.md'), '- **Goal:** g\n');
+  const env = { ...process.env, FORGE_POD_HOME: tmp('home'), FORGE_POD_STATE: tmp('state') };
+  delete env.FORGE_POD_CONFIG;
+  const script = path.join(REPO_ROOT, 'lib', 'pod.mjs');
+  const { spawn } = await import('node:child_process');
+  const launch = (item) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, 'handoff', 'engineer', '--packet', 'packet.md', '--item', item, '--from', 'pm'], { cwd: repo, env, stdio: 'ignore' });
+    child.on('exit', (code) => resolve(code));
+  });
+  // Eight processes start together and race for two slots.
+  const codes = await Promise.all(Array.from({ length: 8 }, (_, i) => launch(`ITEM-${i}`)));
+  assert.equal(codes.filter((c) => c === EXIT.ok).length, 2, `exit codes: ${codes}`);
+  assert.equal(codes.filter((c) => c === EXIT.refused).length, 6, `exit codes: ${codes}`);
+  const cfg = loadConfig(path.join(repo, '.github', 'pod', 'project.yml')).cfg;
+  const recorded = readStatus(cfg, env).filter((r) => r.event === 'handoff');
+  assert.equal(recorded.length, 2, 'only the two accepted handoffs are on the ledger');
+  assert.ok(!fs.existsSync(path.join(env.FORGE_POD_STATE, 'ledger.lock')), 'the lock is released');
 });
 
 // ---------- project root ----------
