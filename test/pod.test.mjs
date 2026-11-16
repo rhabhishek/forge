@@ -16,7 +16,7 @@ import { planUpdate } from '../lib/update.mjs';
 import {
   ROLE_NAMES, ROLES, BASELINE_NEVER, parseYaml, normalizeConfig, validateConfig, loadConfig,
   findConfig, findProject, planHandoff, appendStatus, readStatus, allDenyPatterns, modelFor,
-  renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, ledgerKind, localBuilds, EXIT,
+  renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, admitEngineer, ledgerKind, localBuilds, EXIT,
 } from '../lib/pod.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `forge-pod-${name}-`));
@@ -596,6 +596,67 @@ test('on the local ledger a handoff reserves the engineer slot before the engine
   ];
   assert.deepEqual(localBuilds(rows, cfg), ['Y']);
   assert.deepEqual(localBuilds(rows, contract({ limits: { claim_timeout_minutes: 60 } })).sort(), ['X', 'Y']);
+});
+
+test('an engineer whose reservation lapsed cannot start after its slot was given away', async () => {
+  const repo = tmp('lapsed');
+  fs.mkdirSync(path.join(repo, '.github', 'pod'), { recursive: true });
+  const file = path.join(repo, '.github', 'pod', 'project.yml');
+  fs.writeFileSync(file, example().replace(/engineers: 3/, 'engineers: 1'));
+  fs.writeFileSync(path.join(repo, 'packet.md'), '- **Goal:** g\n');
+  const env = { FORGE_POD_HOME: tmp('home'), FORGE_POD_STATE: tmp('state') };
+  const lines = [];
+  const run = (args) => { lines.length = 0; return main(args, { cwd: repo, env, out: (l) => lines.push(l) }); };
+  const cfg = loadConfig(file).cfg;
+  const handoff = (item) => run(['handoff', 'engineer', '--packet', 'packet.md', '--item', item, '--from', 'pm']);
+  const start = (item) => run(['status', 'engineer', 'working', ...(item ? ['--item', item] : [])]);
+  const working = () => readStatus(cfg, env).filter((r) => r.role === 'engineer' && r.state === 'working').map((r) => r.item);
+
+  // A is handed off but its engineer does not start. The reservation lapses.
+  appendStatus(cfg, { ts: new Date(Date.now() - 31 * 60000).toISOString(), event: 'handoff', role: 'pm', to: 'engineer', item: 'A' }, env);
+  assert.equal(await handoff('B'), EXIT.ok, 'the lapsed slot goes to B');
+  assert.equal(await start('B'), EXIT.ok);
+
+  // The delayed engineer for A now turns up. It must not become a second engineer.
+  assert.equal(await start('A'), EXIT.refused);
+  assert.match(lines.join('\n'), /Stop: no live reservation for A: .* lapsed before work began/);
+  assert.deepEqual(working(), ['B'], 'the refused start recorded nothing');
+
+  // Never handed off, or started without naming an item: refused the same way.
+  assert.equal(await start('NEVER'), EXIT.refused);
+  assert.equal(await start(null), EXIT.refused);
+  assert.match(lines.join('\n'), /--item is required/);
+
+  // Reporting `working` again on the item it holds is fine; so are other roles.
+  assert.equal(await start('B'), EXIT.ok);
+  assert.equal(await run(['status', 'tester', 'working', '--item', 'A']), EXIT.ok);
+
+  // Once B finishes, A needs a new handoff, and then it may start.
+  assert.equal(await run(['status', 'engineer', 'done', '--item', 'B']), EXIT.ok);
+  assert.equal(await start('A'), EXIT.refused, 'a free slot is not a reservation');
+  assert.equal(await handoff('A'), EXIT.ok);
+  assert.equal(await start('A'), EXIT.ok);
+
+  // A withdrawn handoff does not admit either.
+  appendStatus(cfg, { event: 'release', role: 'pm', to: 'engineer', item: 'A' }, env);
+  assert.equal(await start('A'), EXIT.refused);
+});
+
+test('on a tracker ledger an engineer may start only on an item that is in build', async () => {
+  const repo = tmp('admit');
+  fs.mkdirSync(path.join(repo, '.claude', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'pod', 'project.yml'), example()
+    .replace('repo: owner/name', 'repo: acme/app').replace('type: manual ', 'type: claude-cloud '));
+  const env = { FORGE_POD_HOME: tmp('home') };
+  const gh = fakeGithub({ issues: { 1: [BUILD], 2: ['pod: ready'] } });
+  const lines = [];
+  const start = (item) => { lines.length = 0; return main(['status', 'engineer', 'working', '--item', item], { cwd: repo, env, out: (l) => lines.push(l), transport: gh.transport }); };
+  assert.equal(await start('1'), EXIT.ok);
+  assert.equal(await start('2'), EXIT.refused, 'withdrawn by a race, or never handed off');
+  assert.match(lines.join('\n'), /2 is not in the in-progress state, so it holds no engineer slot/);
+  gh.fail = 'HTTP 503';
+  assert.equal(await start('1'), EXIT.unverified);
+  assert.equal(await admitEngineer({ kind: 'tracker', inBuild: async () => ['7'] }, '7'), null);
 });
 
 test('interleaved local handoffs cannot both take the last engineer slot', async () => {
