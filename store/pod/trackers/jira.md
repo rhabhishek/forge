@@ -11,4 +11,4 @@
 - **Tools:** use the host's Atlassian tools.
 - **Findings:** a Jira issue has no lines to anchor to, so findings on a change are posted inline on the pull request in the code host (see that host's note or tool), and the issue gets one comment that links to the review and gives the verdict and counts.
 - **Never:** change workflows, fields, permissions, or sprint scope, and never resolve an issue yourself; the human closes it after merging.
-- **Run claims:** `pod claim` and `pod report` write `[pod:claim ...]` and `[pod:report ...]` comments. Jira comments are not edited or deleted by the pod yet, so a run leaves a claim and a report (two comments), and a run that loses a claim race leaves its claim until it lapses. Both are harmless to the guard.
+- **Run claims:** `pod claim` and `pod report` write `[pod:claim ...]` and `[pod:report ...]` comments. The report edits the run's claim comment in place, and a run that loses a claim race deletes its own claim, so each run leaves one comment.

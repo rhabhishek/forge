@@ -757,6 +757,88 @@ test('a handoff after the receiver ran is new, even if the receiver approved and
   }
 });
 
+test('a run proceeds only when the earliest live claim is provably its own', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  // The read-back does not show our claim (an inconsistent read): stop, and take the claim back.
+  const gh = fakeGithub({ issues: { 11: [BUILD] } });
+  const real = gh.transport;
+  let posted = false;
+  gh.transport = async (req) => {
+    const res = await real(req);
+    if (req.method === 'POST') posted = true;
+    else if (posted && Array.isArray(res)) return res.filter((c) => !/pod:claim/.test(c.body));
+    return res;
+  };
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  const out = await claimRun(ledger, cfg, 'reviewer', { item: '11', head: 'abc1234', run: 'ghost' }, env);
+  assert.match(out.stop, /did not show up when the ledger was read back/);
+  assert.equal(gh.comments.length, 0, 'the unconfirmed claim was removed');
+});
+
+test('claims are ordered by the tracker\'s time, not by list position', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 12: [BUILD] } });
+  const soon = (s) => new Date(Date.now() + s * 1000).toISOString();
+  // Listed first but written later: the earlier one (late-listed) holds the item.
+  gh.addComment(12, '<!-- pod:claim role=tester head=abc1234 run=later -->', soon(2));
+  gh.addComment(12, '<!-- pod:claim role=tester head=abc1234 run=earlier -->', soon(1));
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.match((await claimRun(ledger, cfg, 'tester', { item: '12', head: 'abc1234', run: 'me' }, env)).stop, /another tester run \(earlier\)/);
+});
+
+test('full shas match exactly; a short sha matches by prefix', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 13: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  const a = `abc1234${'0'.repeat(33)}`;
+  const b = `abc1234${'1'.repeat(33)}`;
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: a, run: 'r1' }, env)).claimed, true);
+  await reportRun(ledger, 'reviewer', { item: '13', head: a, verdict: 'APPROVED', run: 'r1' });
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: b, run: 'r2' }, env)).claimed, true, 'a different full sha with the same prefix is a different head');
+  await reportRun(ledger, 'reviewer', { item: '13', head: b, verdict: 'APPROVED', run: 'r2' });
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: a.slice(0, 10), run: 'r3' }, env)).stop, /already reported/, 'a short sha still finds its full head');
+});
+
+test('on jira a losing claim is removed and a report replaces the claim', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...WORK, runtime: { type: 'copilot-cli', where: 'actions' } });
+  const jira = fakeJira({ 'ABC-1': 'In Progress' });
+  const ledger = openLedger(cfg, { env, transport: jira.transport });
+  const comments = () => jira.issues.get('ABC-1').comments;
+
+  assert.equal((await claimRun(ledger, cfg, 'tester', { item: 'ABC-1', head: 'f00d000', run: 't1' }, env)).claimed, true);
+  await reportRun(ledger, 'tester', { item: 'ABC-1', head: 'f00d000', verdict: 'APPROVED', run: 't1' });
+  assert.equal(comments().length, 1, 'one comment per run');
+  assert.match(comments()[0].body, /^\[pod:report from=tester head=f00d000 verdict=APPROVED run=t1\]/);
+
+  // A rival's claim lands between our check and our write: ours is taken back.
+  const real = jira.transport;
+  let rival = true;
+  jira.transport = async (req) => {
+    if (rival && req.method === 'POST') { rival = false; await real({ method: 'POST', path: req.path, body: { body: '[pod:claim role=em head=item run=rival] **Working:** em.' } }); }
+    return real(req);
+  };
+  const lost = await claimRun(openLedger(cfg, { env, transport: jira.transport }), cfg, 'em', { item: 'ABC-1', run: 'mine' }, env);
+  assert.match(lost.stop, /concurrent em run \(rival\)/);
+  assert.ok(!comments().some((c) => /run=mine/.test(c.body)), 'the losing claim is deleted on jira too');
+});
+
+test('a report the tracker will not edit in is posted as a new comment and still closes the claim', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 14: [BUILD] } });
+  const real = gh.transport;
+  gh.transport = async (req) => { if (req.method === 'PATCH') throw new Error('HTTP 403'); return real(req); };
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.equal((await claimRun(ledger, cfg, 'em', { item: '14', run: 'e1' }, env)).claimed, true);
+  await reportRun(ledger, 'em', { item: '14', verdict: 'DONE', run: 'e1' });
+  assert.equal(gh.comments.length, 2, 'claim kept, report added');
+  assert.equal((await claimRun(ledger, cfg, 'em', { item: '14', run: 'e2' }, env)).claimed, true, 'the report closed the claim');
+});
+
 test('an oversized packet is cut, never allowed to fail the handoff', async () => {
   const env = { FORGE_POD_STATE: tmp('empty-state') };
   const cfg = contract(CLOUD);
@@ -777,10 +859,16 @@ function fakeJira(issues) {
       const status = query.jql.match(/status = "([^"]+)"/)?.[1];
       return { issues: [...db.issues].filter(([, i]) => !status || i.status === status).map(([key]) => ({ key })) };
     }
-    const [, key, what] = p.match(/^\/rest\/api\/2\/issue\/([^/]+)\/(comment|transitions)$/);
+    const [, key, what, cid] = p.match(/^\/rest\/api\/2\/issue\/([^/]+)\/(comment|transitions)(?:\/([^/]+))?$/);
     const issue = db.issues.get(key);
+    if (what === 'comment' && cid) {
+      const c = issue.comments.find((x) => x.id === cid);
+      assert.ok(c, `no jira comment ${cid}`);
+      if (method === 'PUT') { c.body = body.body; return { ...c, updated: stamp() }; }
+      if (method === 'DELETE') { issue.comments.splice(issue.comments.indexOf(c), 1); return null; }
+    }
     if (what === 'comment' && method === 'GET') return { comments: issue.comments };
-    if (what === 'comment') { const c = { body: body.body, created: stamp() }; issue.comments.push(c); return c; }
+    if (what === 'comment') { const c = { id: String(1000 + ++db.tick), body: body.body, created: stamp() }; issue.comments.push(c); return c; }
     if (method === 'GET') return { transitions: (db.transitions || ['In Progress', 'Ready']).map((name, id) => ({ id: String(id), to: { name } })) };
     issue.status = (db.transitions || ['In Progress', 'Ready'])[Number(body.transition.id)];
     return null;
