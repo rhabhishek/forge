@@ -70,7 +70,9 @@ limits:
   round_trips: 3
   # daily_sessions: {pm: 4, em: 12}
   # claim_timeout_minutes: 30   # local ledger: how long a handoff to the engineer holds a slot
-  #                             # before the engineer has reported `working`
+  #                             # before the engineer has reported `working`; also how long an
+  #                             # identical repeat handoff is treated as a duplicate
+  # run_claim_minutes: 180      # how long a run's claim on an item holds if the run never reports
   # ledger: tracker          # where limits are counted. Hosted runtimes (claude-cloud, copilot-cli on
   #                          # actions) always use the tracker; local and manual default to this machine.
 
