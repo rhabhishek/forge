@@ -17,6 +17,7 @@ import {
   ROLE_NAMES, ROLES, BASELINE_NEVER, parseYaml, normalizeConfig, validateConfig, loadConfig,
   findConfig, findProject, planHandoff, appendStatus, readStatus, allDenyPatterns, modelFor,
   renderBoard, boardData, renderWorkflow, main, openLedger, checkHandoff, claimHandoff, admitEngineer, ledgerKind, localBuilds, EXIT,
+  claimRun, reportRun, duplicateHandoff, parseNote,
 } from '../lib/pod.mjs';
 
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `forge-pod-${name}-`));
@@ -347,17 +348,35 @@ test('judging roles are told to report findings inline, and the tracker notes sa
   assert.match(read('pod', 'trackers', 'jira.md'), /inline on the pull request/);
 });
 
+test('every role claims before working, names itself, and never hand-writes markers', () => {
+  const read = (...p) => fs.readFileSync(path.join(STORE_DIR, ...p), 'utf8');
+  const protocol = read('pod', 'protocol.md');
+  assert.match(protocol, /## One run per item/);
+  assert.match(protocol, /Never post the packet or a `pod:` marker yourself/);
+  assert.match(protocol, /\*\*Say who you are\.\*\*.*\*\*\[<role> · <severity>\]\*\*/s);
+  assert.match(protocol, /\*\*Do not repeat a finding\.\*\*/);
+  assert.match(read('pod', 'trackers', 'github.md'), /\*\*\[<role> · <severity>\]\*\*/);
+  assert.match(read('pod', 'runtimes', 'claude-cloud.md'), /never post a handoff marker yourself/);
+  for (const role of ROLE_NAMES) {
+    const prompt = read('prompts', `pod-${ROLES[role].prompt || role}.prompt.md`.replace('pod-reviewer', 'pod-review').replace('pod-tester', 'pod-test').replace('pod-engineer', 'pod-build'));
+    assert.match(prompt, new RegExp(`claim ${role} --item <id>`), `${role} prompt must claim before working`);
+    assert.match(prompt, /Never post a `pod:` marker/);
+  }
+  assert.match(read('pod', 'roles', 'reviewer.md'), /claim reviewer --item <id> --head <head sha>/);
+  assert.match(read('agents', 'tester.agent.md'), /claim tester --item <id> --head <head sha>/);
+});
+
 // ---------- ledger: limits are enforced where the pod actually runs ----------
 
 // In-memory GitHub REST double. Timestamps come from a counter, like a server
 // clock, so ordering between "concurrent" writers is deterministic.
 function fakeGithub({ issues = {}, comments = [] } = {}) {
-  const db = { issues: new Map(), comments: [...comments], calls: [], tick: 0, fail: null, onPost: null };
+  const db = { issues: new Map(), comments: [...comments], calls: [], tick: 0, fail: null, onPost: null, nextId: 1000 };
   for (const [n, labels] of Object.entries(issues)) db.issues.set(String(n), { number: Number(n), labels: [...labels] });
   const stamp = () => new Date(Date.UTC(2030, 0, 1, 0, 0, ++db.tick)).toISOString();
   const issue = (n) => db.issues.get(n) || db.issues.set(n, { number: Number(n), labels: [] }).get(n);
-  const view = (c) => ({ body: c.body, created_at: c.created_at, issue_url: `https://api.example/repos/acme/app/issues/${c.issue}` });
-  db.addComment = (n, body, at) => db.comments.push({ issue: String(n), body, created_at: at || stamp() });
+  const view = (c) => ({ id: c.id, body: c.body, created_at: c.created_at, issue_url: `https://api.example/repos/acme/app/issues/${c.issue}` });
+  db.addComment = (n, body, at) => db.comments.push({ id: ++db.nextId, issue: String(n), body, created_at: at || stamp() });
   db.transport = async ({ method = 'GET', path: p, query = {}, body }) => {
     db.calls.push(`${method} ${p}`);
     if (db.fail) throw new Error(db.fail);
@@ -368,12 +387,18 @@ function fakeGithub({ issues = {}, comments = [] } = {}) {
       return [...db.issues.values()].filter((i) => i.labels.includes(query.labels))
         .map((i) => ({ number: i.number, labels: i.labels.map((name) => ({ name })), ...(i.pr ? { pull_request: {} } : {}) }));
     }
+    if (first === 'comments' && third) {
+      const c = db.comments.find((x) => String(x.id) === third);
+      assert.ok(c, `no comment ${third}`);
+      if (method === 'PATCH') { c.body = body.body; return view(c); }
+      if (method === 'DELETE') { db.comments.splice(db.comments.indexOf(c), 1); return null; }
+    }
     if (first === 'comments') return db.comments.filter((c) => c.created_at >= query.since).map(view);
     if (!second) return { number: Number(first), labels: issue(first).labels.map((name) => ({ name })) };
     if (second === 'comments' && method === 'GET') return db.comments.filter((c) => c.issue === first).map(view);
     if (second === 'comments' && method === 'POST') {
       if (db.onPost) { const hook = db.onPost; db.onPost = null; hook(db, stamp); }
-      const c = { issue: first, body: body.body, created_at: stamp() };
+      const c = { id: ++db.nextId, issue: first, body: body.body, created_at: stamp() };
       db.comments.push(c);
       return view(c);
     }
@@ -420,8 +445,10 @@ test('on a hosted runtime with an empty machine, every limit and the pause still
   for (let i = 0; i < 3; i++) {
     assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '1', from: i % 2 ? 'tester' : 'reviewer' }, env), null);
   }
+  // A real round trip: the engineer hands the fix back before the next return.
+  gh.addComment(1, '<!-- pod:handoff from=engineer to=reviewer -->');
   assert.match(await claimHandoff(ledger, cfg, 'engineer', { item: '1', from: 'reviewer' }, env), /round-trip limit reached for 1 \(3\/3\)/);
-  assert.equal(gh.comments.filter((c) => c.issue === '1').length, 3);
+  assert.equal(gh.comments.filter((c) => c.issue === '1').length, 4, 'three returns plus the engineer handback; the refused one adds nothing');
   assert.match(gh.comments[0].body, /^<!-- pod:handoff from=reviewer to=engineer -->/);
 
   // Daily cap, counted from markers written since midnight UTC.
@@ -520,6 +547,308 @@ test('the handoff command fails closed when limits cannot be verified', async ()
   assert.match(lines.join('\n'), /the pod is paused/);
 });
 
+// ---------- duplicates: one handoff, one run per role per change ----------
+
+test('a repeated handoff is recorded once and does not start the receiver again', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 3: ['pod: blocked'] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+
+  assert.equal(await claimHandoff(ledger, cfg, 'architect', { item: '3', from: 'em' }, env), null);
+  const again = await claimHandoff(ledger, cfg, 'architect', { item: '3', from: 'em' }, env);
+  assert.ok(again?.duplicate, 'the second, identical handoff is a repeat');
+  assert.equal(gh.comments.length, 1, 'and records nothing');
+
+  // A different sender, or anything recorded since, makes a new handoff legitimate.
+  assert.equal(await duplicateHandoff(ledger, cfg, 'architect', { item: '3', from: 'pm' }), null);
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '3', from: 'architect' }, env), null);
+  assert.equal(await claimHandoff(ledger, cfg, 'architect', { item: '3', from: 'em' }, env), null);
+  assert.equal(gh.comments.length, 3);
+
+  // An identical handoff older than the claim window is not a repeat.
+  const old = fakeGithub({ issues: { 4: [] } });
+  old.addComment(4, '<!-- pod:handoff from=em to=architect -->', '2020-01-01T00:00:00Z');
+  assert.equal(await duplicateHandoff(openLedger(cfg, { env, transport: old.transport }), cfg, 'architect', { item: '4', from: 'em' }), null);
+});
+
+test('the handoff command reports a repeat without naming a task to fire', async () => {
+  const repo = tmp('repeat');
+  fs.mkdirSync(path.join(repo, '.claude', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'pod', 'project.yml'), example()
+    .replace('repo: owner/name', 'repo: acme/app').replace('type: manual ', 'type: claude-cloud ')
+    .replace(/^# tasks: .*$/m, `tasks: {${ROLE_NAMES.map((r) => `${r}: task_${r}`).join(', ')}}`));
+  fs.writeFileSync(path.join(repo, 'packet.md'), '- **Goal:** g\n');
+  const env = { FORGE_POD_HOME: tmp('home') };
+  const gh = fakeGithub({ issues: { 6: [BUILD] } });
+  const lines = [];
+  const run = () => { lines.length = 0; return main(['handoff', 'reviewer', '--packet', 'packet.md', '--from', 'engineer', '--item', '6'], { cwd: repo, env, out: (l) => lines.push(l), transport: gh.transport }); };
+
+  assert.equal(await run(), EXIT.ok);
+  assert.match(lines.join('\n'), /Fire scheduled task task_reviewer/);
+  assert.match(gh.comments[0].body, /^<!-- pod:handoff from=engineer to=reviewer -->\n\*\*Handoff:\*\* engineer -> reviewer\n\n<details><summary>Packet<\/summary>\n\n- \*\*Goal:\*\* g\n\n<\/details>$/,
+    'one comment carries the marker, a one-line summary, and the packet folded away');
+  assert.equal(await run(), EXIT.ok);
+  assert.match(lines.join('\n'), /Already handed off: engineer -> reviewer on 6/);
+  assert.doesNotMatch(lines.join('\n'), /task_reviewer/, 'a repeat must not tell the role to fire the task again');
+  assert.equal(gh.comments.length, 1);
+});
+
+test('two runs of one role claiming the same head leave exactly one working', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 7: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+
+  // A rival run's claim lands between our check and our write: the earlier claim stands.
+  gh.onPost = (db, stamp) => db.addComment(7, '<!-- pod:claim role=reviewer head=abc1234 run=rival -->', stamp());
+  const lost = await claimRun(ledger, cfg, 'reviewer', { item: '7', head: 'abc1234def', run: 'mine' }, env);
+  assert.match(lost.stop, /concurrent reviewer run \(rival\) claimed 7 first/);
+  assert.ok(!gh.comments.some((c) => /run=mine/.test(c.body)), 'the losing run takes its own claim back');
+
+  // Seen before posting: stop without writing anything.
+  const count = gh.comments.length;
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '7', head: 'abc1234', run: 'late' }, env)).stop, /another reviewer run \(rival\)/);
+  assert.equal(gh.comments.length, count);
+
+  // Another role judges the same head independently.
+  assert.equal((await claimRun(ledger, cfg, 'tester', { item: '7', head: 'abc1234', run: 't1' }, env)).claimed, true);
+});
+
+test('a reported head is not judged again; a new head or a stale claim is', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 8: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '8', head: 'aaa1111', run: 'r1' }, env)).claimed, true);
+  assert.match(gh.comments.at(-1).body, /^<!-- pod:claim role=reviewer head=aaa1111 run=r1 -->\n\*\*Working:\*\* reviewer on aaa1111\.$/);
+  await reportRun(ledger, 'reviewer', { item: '8', head: 'aaa1111', verdict: 'APPROVED', run: 'r1' });
+  assert.equal(gh.comments.length, 1, 'the report replaces the run\'s claim: one comment per run');
+  assert.equal(gh.comments[0].body, '<!-- pod:report from=reviewer head=aaa1111 verdict=APPROVED run=r1 -->\n**Done:** reviewer on aaa1111: APPROVED.');
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '8', head: 'aaa1111', run: 'r2' }, env)).stop, /already reported on 8 at aaa1111 \(APPROVED/);
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '8', head: 'bbb2222', run: 'r3' }, env)).claimed, true, 'a new push is judged');
+
+  // A run that claimed and died without reporting does not hold the head forever.
+  gh.addComment(8, '<!-- pod:claim role=tester head=ccc3333 run=dead -->', '2020-01-01T00:00:00Z');
+  assert.equal((await claimRun(ledger, cfg, 'tester', { item: '8', head: 'ccc3333', run: 't2' }, env)).claimed, true);
+
+  // Without a head the claim covers the item, and a report does not close the item for good.
+  assert.equal((await claimRun(ledger, cfg, 'em', { item: '8', run: 'e1' }, env)).claimed, true);
+  assert.match((await claimRun(ledger, cfg, 'em', { item: '8', run: 'e2' }, env)).stop, /another em run \(e1\) claimed 8 at/);
+
+  await assert.rejects(reportRun(ledger, 'reviewer', { item: '8', verdict: 'LGTM' }), /--verdict must be one of/);
+  gh.issues.set('9', { number: 9, labels: ['pod: paused'] });
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '8', head: 'ddd4444' }, env)).stop, /paused/);
+});
+
+test('claims bind on the local and jira ledgers too, and the claim command fails closed', async () => {
+  const env = { FORGE_POD_STATE: tmp('claims-local') };
+  const cfg = contract();
+  const ledger = openLedger(cfg, { env });
+  assert.equal(ledger.kind, 'local');
+  assert.equal((await claimRun(ledger, cfg, 'tester', { item: 'X-1', head: 'f00d000', run: 'a' }, env)).claimed, true);
+  assert.match((await claimRun(ledger, cfg, 'tester', { item: 'X-1', head: 'f00d000', run: 'b' }, env)).stop, /another tester run \(a\)/);
+  await reportRun(ledger, 'tester', { item: 'X-1', head: 'f00d000', verdict: 'CHANGES_REQUIRED' });
+  assert.match((await claimRun(ledger, cfg, 'tester', { item: 'X-1', head: 'f00d000', run: 'c' }, env)).stop, /already reported .*CHANGES_REQUIRED/);
+
+  assert.deepEqual(parseNote('[pod:claim role=reviewer head=abc1234 run=x1] Pod claim: reviewer run x1.'), { kind: 'claim', role: 'reviewer', head: 'abc1234', run: 'x1' });
+  assert.deepEqual(parseNote('<!-- pod:handoff from=em to=architect round=2 -->'), { kind: 'handoff', from: 'em', to: 'architect', round: '2' });
+
+  const repo = tmp('claim-cli');
+  fs.mkdirSync(path.join(repo, '.claude', 'pod'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.claude', 'pod', 'project.yml'), example()
+    .replace('repo: owner/name', 'repo: acme/app').replace('type: manual ', 'type: claude-cloud '));
+  const gh = fakeGithub({ issues: { 5: [BUILD] } });
+  const lines = [];
+  const run = (args) => { lines.length = 0; return main(args, { cwd: repo, env: { FORGE_POD_HOME: tmp('home') }, out: (l) => lines.push(l), transport: gh.transport }); };
+  assert.equal(await run(['claim', 'reviewer', '--item', '5', '--head', 'abc1234', '--run', 'one']), EXIT.ok);
+  assert.match(lines.join('\n'), /Claimed: reviewer run one/);
+  assert.equal(await run(['claim', 'reviewer', '--item', '5', '--head', 'abc1234', '--run', 'two']), EXIT.refused);
+  assert.match(lines.join('\n'), /^Stop: another reviewer run \(one\)/);
+  assert.equal(await run(['report', 'reviewer', '--item', '5', '--head', 'abc1234', '--verdict', 'APPROVED', '--run', 'one']), EXIT.ok);
+  gh.fail = 'HTTP 502';
+  assert.equal(await run(['claim', 'reviewer', '--item', '5', '--head', 'def5678']), EXIT.unverified, 'an unreadable ledger is a stop, never a pass');
+  gh.fail = null;
+  await assert.rejects(run(['claim', 'reviewer', '--item', '5', '--head', '--run', 'x']), /--head needs a value/);
+  await assert.rejects(run(['claim', 'reviewer', '--item', '5', '--head', 'a']), /at least 7 hex characters/);
+});
+
+test('a finished run releases the item: later runs of the role may claim it', async () => {
+  // Local ledger: no comment editing, so the report is a separate entry and must still close the claim.
+  const env = { FORGE_POD_STATE: tmp('claims-release') };
+  const cfg = contract();
+  const local = openLedger(cfg, { env });
+  assert.equal((await claimRun(local, cfg, 'engineer', { item: 'Y-1', run: 'e1' }, env)).claimed, true);
+  await reportRun(local, 'engineer', { item: 'Y-1', verdict: 'DONE', run: 'e1' });
+  assert.equal((await claimRun(local, cfg, 'engineer', { item: 'Y-1', run: 'e2' }, env)).claimed, true, 'the report closed e1');
+  // A report without --run closes the role's latest open claim.
+  await reportRun(local, 'engineer', { item: 'Y-1', verdict: 'DONE' });
+  assert.equal((await claimRun(local, cfg, 'engineer', { item: 'Y-1', run: 'e3' }, env)).claimed, true);
+  assert.deepEqual(boardData(cfg, readStatus(cfg, env)).rows.length > 0, true);
+  const { currentWork } = await import('../lib/pod.mjs');
+  assert.ok(!currentWork(readStatus(cfg, env)).some((r) => r.event === 'claim' || r.event === 'report'), 'claims and reports are not role status on the board');
+
+  // GitHub: the report without --run still replaces the open claim in place.
+  const gh = fakeGithub({ issues: { 2: [BUILD] } });
+  const hosted = contract(CLOUD);
+  const ledger = openLedger(hosted, { env, transport: gh.transport });
+  assert.equal((await claimRun(ledger, hosted, 'pm', { item: '2', run: 'p1' }, env)).claimed, true);
+  await reportRun(ledger, 'pm', { item: '2', verdict: 'DONE' });
+  assert.equal(gh.comments.length, 1);
+  assert.match(gh.comments[0].body, /pod:report from=pm head=item verdict=DONE run=p1/);
+  assert.equal((await claimRun(ledger, hosted, 'pm', { item: '2', run: 'p2' }, env)).claimed, true);
+});
+
+test('a role handed the same head again judges it again', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 3: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  const head = 'abcdef1';
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '3', head, run: 'r1' }, env)).claimed, true);
+  await reportRun(ledger, 'reviewer', { item: '3', head, verdict: 'CHANGES_REQUIRED', run: 'r1' });
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '3', from: 'reviewer' }, env), null);
+  // A heartbeat with no new handoff: already judged.
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '3', head, run: 'hb' }, env)).stop, /already reported/);
+  // The engineer disputes a finding without pushing: the reviewer is handed the same head again.
+  assert.equal(await claimHandoff(ledger, cfg, 'reviewer', { item: '3', from: 'engineer' }, env), null);
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '3', head, run: 'r2' }, env)).claimed, true);
+});
+
+test('a repeat is recognised before the limits, and across a fan-out', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...CLOUD, limits: { round_trips: 1 } });
+  const gh = fakeGithub({ issues: { 4: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  // The first return uses the last round trip; its overlapping copy must not be refused for it.
+  assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item: '4', from: 'reviewer' }, env), null);
+  assert.ok((await claimHandoff(ledger, cfg, 'engineer', { item: '4', from: 'reviewer' }, env))?.duplicate);
+
+  // engineer -> reviewer, engineer -> tester, then engineer -> reviewer again: still a repeat.
+  const fan = fakeGithub({ issues: { 5: [BUILD] } });
+  const fl = openLedger(contract(CLOUD), { env, transport: fan.transport });
+  for (const to of ['reviewer', 'tester']) assert.equal(await claimHandoff(fl, contract(CLOUD), to, { item: '5', from: 'engineer' }, env), null);
+  assert.ok((await claimHandoff(fl, contract(CLOUD), 'reviewer', { item: '5', from: 'engineer' }, env))?.duplicate);
+  assert.equal(fan.comments.length, 2);
+});
+
+test('a handoff after the receiver ran is new, even if the receiver approved and handed nothing on', async () => {
+  // The regression: the reviewer approved (a report, no handoff), the tester sent the change back,
+  // and the engineer's handoff of the new head to the reviewer looked like a repeat of the old one.
+  for (const [name, cfg, transport] of [
+    ['github', contract(CLOUD), fakeGithub({ issues: { 9: [BUILD] } }).transport],
+    ['local', contract(), undefined],
+  ]) {
+    const env = { FORGE_POD_STATE: tmp(`fanout-${name}`) };
+    const ledger = openLedger(cfg, { env, transport });
+    const item = name === 'github' ? '9' : 'Z-9';
+    for (const to of ['reviewer', 'tester']) assert.equal(await claimHandoff(ledger, cfg, to, { item, from: 'engineer' }, env), null);
+    assert.equal((await claimRun(ledger, cfg, 'reviewer', { item, head: 'aaa1111', run: 'r1' }, env)).claimed, true);
+    await reportRun(ledger, 'reviewer', { item, head: 'aaa1111', verdict: 'APPROVED', run: 'r1' });
+    assert.equal((await claimRun(ledger, cfg, 'tester', { item, head: 'aaa1111', run: 't1' }, env)).claimed, true);
+    await reportRun(ledger, 'tester', { item, head: 'aaa1111', verdict: 'CHANGES_REQUIRED', run: 't1' });
+    assert.equal(await claimHandoff(ledger, cfg, 'engineer', { item, from: 'tester' }, env), null);
+    // New head bbb2222: both judges must be started again.
+    assert.equal(await claimHandoff(ledger, cfg, 'reviewer', { item, from: 'engineer' }, env), null, `${name}: reviewer is handed the new head`);
+    assert.equal(await claimHandoff(ledger, cfg, 'tester', { item, from: 'engineer' }, env), null, `${name}: tester is handed the new head`);
+    // An overlapping sender before the receiver has run is still a repeat.
+    assert.ok((await claimHandoff(ledger, cfg, 'reviewer', { item, from: 'engineer' }, env))?.duplicate, `${name}: overlap is a repeat`);
+  }
+});
+
+test('a run proceeds only when the earliest live claim is provably its own', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  // The read-back does not show our claim (an inconsistent read): stop, and take the claim back.
+  const gh = fakeGithub({ issues: { 11: [BUILD] } });
+  const real = gh.transport;
+  let posted = false;
+  gh.transport = async (req) => {
+    const res = await real(req);
+    if (req.method === 'POST') posted = true;
+    else if (posted && Array.isArray(res)) return res.filter((c) => !/pod:claim/.test(c.body));
+    return res;
+  };
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  const out = await claimRun(ledger, cfg, 'reviewer', { item: '11', head: 'abc1234', run: 'ghost' }, env);
+  assert.match(out.stop, /did not show up when the ledger was read back/);
+  assert.equal(gh.comments.length, 0, 'the unconfirmed claim was removed');
+});
+
+test('claims are ordered by the tracker\'s time, not by list position', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 12: [BUILD] } });
+  const soon = (s) => new Date(Date.now() + s * 1000).toISOString();
+  // Listed first but written later: the earlier one (late-listed) holds the item.
+  gh.addComment(12, '<!-- pod:claim role=tester head=abc1234 run=later -->', soon(2));
+  gh.addComment(12, '<!-- pod:claim role=tester head=abc1234 run=earlier -->', soon(1));
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.match((await claimRun(ledger, cfg, 'tester', { item: '12', head: 'abc1234', run: 'me' }, env)).stop, /another tester run \(earlier\)/);
+});
+
+test('full shas match exactly; a short sha matches by prefix', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 13: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  const a = `abc1234${'0'.repeat(33)}`;
+  const b = `abc1234${'1'.repeat(33)}`;
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: a, run: 'r1' }, env)).claimed, true);
+  await reportRun(ledger, 'reviewer', { item: '13', head: a, verdict: 'APPROVED', run: 'r1' });
+  assert.equal((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: b, run: 'r2' }, env)).claimed, true, 'a different full sha with the same prefix is a different head');
+  await reportRun(ledger, 'reviewer', { item: '13', head: b, verdict: 'APPROVED', run: 'r2' });
+  assert.match((await claimRun(ledger, cfg, 'reviewer', { item: '13', head: a.slice(0, 10), run: 'r3' }, env)).stop, /already reported/, 'a short sha still finds its full head');
+});
+
+test('on jira a losing claim is removed and a report replaces the claim', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract({ ...WORK, runtime: { type: 'copilot-cli', where: 'actions' } });
+  const jira = fakeJira({ 'ABC-1': 'In Progress' });
+  const ledger = openLedger(cfg, { env, transport: jira.transport });
+  const comments = () => jira.issues.get('ABC-1').comments;
+
+  assert.equal((await claimRun(ledger, cfg, 'tester', { item: 'ABC-1', head: 'f00d000', run: 't1' }, env)).claimed, true);
+  await reportRun(ledger, 'tester', { item: 'ABC-1', head: 'f00d000', verdict: 'APPROVED', run: 't1' });
+  assert.equal(comments().length, 1, 'one comment per run');
+  assert.match(comments()[0].body, /^\[pod:report from=tester head=f00d000 verdict=APPROVED run=t1\]/);
+
+  // A rival's claim lands between our check and our write: ours is taken back.
+  const real = jira.transport;
+  let rival = true;
+  jira.transport = async (req) => {
+    if (rival && req.method === 'POST') { rival = false; await real({ method: 'POST', path: req.path, body: { body: '[pod:claim role=em head=item run=rival] **Working:** em.' } }); }
+    return real(req);
+  };
+  const lost = await claimRun(openLedger(cfg, { env, transport: jira.transport }), cfg, 'em', { item: 'ABC-1', run: 'mine' }, env);
+  assert.match(lost.stop, /concurrent em run \(rival\)/);
+  assert.ok(!comments().some((c) => /run=mine/.test(c.body)), 'the losing claim is deleted on jira too');
+});
+
+test('a report the tracker will not edit in is posted as a new comment and still closes the claim', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 14: [BUILD] } });
+  const real = gh.transport;
+  gh.transport = async (req) => { if (req.method === 'PATCH') throw new Error('HTTP 403'); return real(req); };
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.equal((await claimRun(ledger, cfg, 'em', { item: '14', run: 'e1' }, env)).claimed, true);
+  await reportRun(ledger, 'em', { item: '14', verdict: 'DONE', run: 'e1' });
+  assert.equal(gh.comments.length, 2, 'claim kept, report added');
+  assert.equal((await claimRun(ledger, cfg, 'em', { item: '14', run: 'e2' }, env)).claimed, true, 'the report closed the claim');
+});
+
+test('an oversized packet is cut, never allowed to fail the handoff', async () => {
+  const env = { FORGE_POD_STATE: tmp('empty-state') };
+  const cfg = contract(CLOUD);
+  const gh = fakeGithub({ issues: { 6: [BUILD] } });
+  const ledger = openLedger(cfg, { env, transport: gh.transport });
+  assert.equal(await claimHandoff(ledger, cfg, 'reviewer', { item: '6', from: 'engineer', packet: 'x'.repeat(70000) }, env), null);
+  assert.ok(gh.comments[0].body.length < 65536, 'fits GitHub\'s comment limit');
+  assert.match(gh.comments[0].body, /Packet cut here: 10000 more characters/);
+});
+
 // In-memory Jira REST double covering the calls the ledger makes.
 function fakeJira(issues) {
   const db = { issues: new Map(Object.entries(issues).map(([k, status]) => [k, { status, comments: [] }])), tick: 0 };
@@ -530,10 +859,16 @@ function fakeJira(issues) {
       const status = query.jql.match(/status = "([^"]+)"/)?.[1];
       return { issues: [...db.issues].filter(([, i]) => !status || i.status === status).map(([key]) => ({ key })) };
     }
-    const [, key, what] = p.match(/^\/rest\/api\/2\/issue\/([^/]+)\/(comment|transitions)$/);
+    const [, key, what, cid] = p.match(/^\/rest\/api\/2\/issue\/([^/]+)\/(comment|transitions)(?:\/([^/]+))?$/);
     const issue = db.issues.get(key);
+    if (what === 'comment' && cid) {
+      const c = issue.comments.find((x) => x.id === cid);
+      assert.ok(c, `no jira comment ${cid}`);
+      if (method === 'PUT') { c.body = body.body; return { ...c, updated: stamp() }; }
+      if (method === 'DELETE') { issue.comments.splice(issue.comments.indexOf(c), 1); return null; }
+    }
     if (what === 'comment' && method === 'GET') return { comments: issue.comments };
-    if (what === 'comment') { const c = { body: body.body, created: stamp() }; issue.comments.push(c); return c; }
+    if (what === 'comment') { const c = { id: String(1000 + ++db.tick), body: body.body, created: stamp() }; issue.comments.push(c); return c; }
     if (method === 'GET') return { transitions: (db.transitions || ['In Progress', 'Ready']).map((name, id) => ({ id: String(id), to: { name } })) };
     issue.status = (db.transitions || ['In Progress', 'Ready'])[Number(body.transition.id)];
     return null;
